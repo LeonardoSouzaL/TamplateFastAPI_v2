@@ -1,0 +1,28 @@
+---
+description: GitHub Actions — deploy Docker Swarm (build GHCR, stack deploy, wait 3/3).
+globs: ".github/workflows/deploy*.yml,.github/workflows/*swarm*.yml"
+alwaysApply: false
+---
+
+# GitHub Actions — deploy Docker Swarm
+
+**Use a Skill `deploy-swarm-fastapi`** em `.cursor/skills/deploy-swarm-fastapi/SKILL.md`.
+
+Complementa `130-fastapi-swarm-deploy-manual.mdc` e `131-docker-swarm-stack-auto.mdc`.
+
+## Princípios (globs desta rule)
+
+- Pipeline **separado** de `ci.yml` (workflow distinto), mas **encadeado** — deploy roda **depois** do CI, nunca em paralelo. Runner `[self-hosted, linux, swarm]`.
+- Gatilho **obrigatório** quando existe `ci.yml` na main: `workflow_run` com `workflows: ["CI"]`, `types: [completed]`, `branches: [main]` + gate `if: ${{ github.event.workflow_run.conclusion == 'success' }}`. **Proibido** `on: push` nesse caso.
+- Se o projeto **não** tiver `ci.yml`, **perguntar** ao usuário antes de usar `on: push`.
+- Em `workflow_run`, usar **`github.event.workflow_run.head_sha`** (não `github.sha`) — commit testado pelo CI. Aplicar em `checkout` (`ref`), tag GHCR, `CACHE_BUST` e no grep do `Wait for replicas`. Sugestão: `env.COMMIT_SHA`.
+- Build GHCR com `CACHE_BUST=${{ env.COMMIT_SHA }}`; `docker pull` antes do deploy.
+- `docker stack deploy --with-registry-auth`; wait **600s** com validação `3/3` na mesma tag SHA.
+- `STACK_NAME` fixo entre deploys; `.env` real em `/opt/envs/{app}.env` (não versionar).
+- Alembic opcional — **não** usar `manage.py migrate` em FastAPI.
+
+Efeito esperado: **1 push na main = 1 run de CI + 0 ou 1 run de Deploy** (após CI verde). Em PRs, só o CI roda; o deploy não (filtro `branches: [main]`).
+
+Template: `docs/cursor/templates/deploy-swarm.yml`.
+
+Contexto: `docs/contexto_infra_swarm_cursor.md` (seção 17 — encadeamento CI → deploy).

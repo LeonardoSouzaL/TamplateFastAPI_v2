@@ -1,0 +1,21 @@
+---
+description: Avalia novas classes e promove abstrações reutilizáveis para core quando fizer sentido.
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Rule: Classes reutilizáveis e abstrações no `core/`
+
+Antes de criar uma classe nova, avalie se é capacidade técnica reutilizável ou regra de negócio de um módulo.
+
+## Princípios
+
+- **Reutilizável** (e-mail, storage, PDF, mensageria, client HTTP) → `core/` com contrato abstrato quando fizer sentido.
+- **Domínio específico** (`OrderService`, regras de status) → `services/`.
+- Evitar: `Core -> Service`, `Core -> CRUD/model de domínio`.
+
+## Referência completa
+
+Exemplos, checklist e padrões de pacote: `docs/cursor/core-abstractions.md`.
+
+Ao criar abstração em `core/`, atualizar `core/README.md` (se existir), README principal e **Alterações recentes**.

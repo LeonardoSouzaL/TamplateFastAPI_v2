@@ -1,0 +1,20 @@
+---
+description: GitHub Actions CI para pytest unitário — workflow, config de CI, UTF-8 em requirements e markers.
+globs: "{.github/**/*.yml,.github/**/*.yaml,requirements.txt,requirements-dev.txt,pytest.ini,core/example-config.py}"
+alwaysApply: false
+---
+
+# GitHub Actions — CI de testes
+
+**Use a Skill `configurar-ci-github-actions`** em `.cursor/skills/configurar-ci-github-actions/SKILL.md`.
+
+Complementa `070-tests-auto.mdc` e `080-security-config-always.mdc`.
+
+## Princípios
+
+- CI roda **apenas** testes unitários (`-m "not integration"`).
+- `requirements.txt` e `requirements-dev.txt` em **UTF-8** (nunca UTF-16).
+- Secrets fictícios no workflow; `cp core/example-config.py core/config.py` se config não versionado.
+- Pipeline separado de `deploy-swarm.yml`.
+
+Template completo: `docs/cursor/templates/ci.yml`.

@@ -1,0 +1,953 @@
+---
+description: Observabilidade FastAPI com OpenTelemetry, Grafana Tempo, Loki e logs correlacionados
+globs:
+  - "**/*.py"
+  - "**/config*"
+  - "**/requirements*.txt"
+  - "**/pyproject.toml"
+alwaysApply: true
+---
+
+# Regra Cursor — FastAPI | OpenTelemetry + Tempo + Loki
+
+Sempre responder em português do Brasil.
+
+Esta regra deve ser aplicada em projetos FastAPI para implementar observabilidade com:
+
+- OpenTelemetry para traces.
+- Grafana Tempo para armazenamento e consulta de traces.
+- Loki para centralização de logs.
+- Label `level` obrigatória nos logs enviados ao Loki para retenção diferenciada.
+- Logs correlacionados com `trace_id`, `span_id` e `service.name`.
+- Handler global de exceções.
+- Configuração controlada por `config`.
+- Código isolado em `core/telemetry.py` e `core/logging_config.py`.
+
+Antes de alterar qualquer arquivo, analise a estrutura do projeto e apresente um plano curto de implementação.
+
+---
+
+# Infra de observabilidade
+
+O Grafana consulta o Tempo pela porta 3200:
+
+```text
+http://tempo:3200
+```
+
+As aplicações FastAPI devem enviar traces para o Tempo via OTLP HTTP na porta 4318:
+
+```text
+http://192.168.0.213:4318
+```
+
+Endpoint final usado pelo exporter:
+
+```text
+http://192.168.0.213:4318/v1/traces
+```
+
+Logs devem ser enviados para Loki:
+
+```text
+http://192.168.0.213:3100/loki/api/v1/push
+```
+
+---
+
+# Retenção por nível no Loki
+
+A política de retenção diferenciada do Loki depende de **labels da stream**.
+
+O Loki não deve tentar identificar erro lendo o texto da mensagem do log para
+definir retenção. Seletores de retenção como `retention_stream` funcionam sobre
+labels, por exemplo:
+
+```logql
+{level="error"}
+```
+
+Por isso, toda aplicação FastAPI que enviar logs para o Loki deve incluir a
+label `level`, preenchida a partir de `record.levelname.lower()`.
+
+Política esperada:
+
+- Logs comuns: 24h.
+- Logs com `level="error"`: 7 dias.
+- Logs com `level="critical"`: 7 dias.
+
+Configuração recomendada no Loki:
+
+```yaml
+limits_config:
+  retention_period: 24h
+
+  retention_stream:
+    - selector: '{level=~"(?i)(error|critical)"}'
+      priority: 20
+      period: 168h
+```
+
+A label `level` deve ser criada na aplicação, no `core/logging_config.py`.
+Não colocar `level` como tag fixa dentro do handler, porque o valor precisa
+variar conforme cada log (`info`, `warning`, `error`, `critical`, etc.).
+
+---
+
+# Envio assíncrono ao Loki (LOKI_ASYNC)
+
+Em produção e homologação, **preferir envio assíncrono** ao Loki para que
+requisições HTTP da API não bloqueiem quando o Loki estiver lento ou
+indisponível.
+
+| `LOKI_ASYNC` | Handler | Comportamento |
+|--------------|---------|---------------|
+| `True` (padrão) | `logging_loki.LokiQueueHandler` | Fila + thread de background (`Queue(-1)`) |
+| `False` | `logging_loki.LokiHandler` | Push HTTP síncrono no thread do request |
+
+Regras:
+
+- `LOKI_ASYNC` fica no `config` (`settings`), não em `.env` isolado.
+- O filtro `loki_level_tag` (`LokiLevelTagFilter`) deve estar presente em
+  **ambos** os handlers (assíncrono e síncrono).
+- O startup não pode quebrar se o Loki estiver indisponível; a fila absorve
+  temporariamente (com `LokiQueueHandler`).
+- Não remover `stdout` — logs continuam no terminal mesmo com Loki ativo.
+
+---
+
+Nunca usar a porta `3200` na aplicação para enviar traces.
+
+Definir o endpoint como campo do `config` (`settings`):
+
+Correto:
+
+```python
+OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://192.168.0.213:4318"
+```
+
+Errado:
+
+```python
+OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://tempo:3200"
+```
+
+Errado:
+
+```python
+OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://192.168.0.213:3200"
+```
+
+---
+
+# Configurações obrigatórias no config
+
+As configurações de observabilidade ficam no `config` centralizado do projeto
+(classe `Settings`/`SettingsExtend` em `core/config.py`), NÃO em arquivo `.env`.
+
+A fonte de verdade é o `settings`. O código de telemetria e logging deve ler de
+`settings`, nunca de `os.getenv` diretamente.
+
+Adicionar ou validar estes campos no `Settings`:
+
+```python
+class Settings(BaseSettings):
+    OTEL_ENABLED: bool = True
+    # Nome BASE do serviço (sem espaços). Ambiente e IP são anexados pelas
+    # properties conforme OTEL_APPEND_ENV / OTEL_APPEND_IP_SUFFIX.
+    OTEL_SERVICE_NAME: str = "NomeAplicacaoFastAPI"
+    OTEL_APPEND_ENV: bool = True
+    OTEL_APPEND_IP_SUFFIX: bool = True
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://192.168.0.213:4318"
+    # Ambiente vem do type_name (ver seção "Separação de ambiente").
+    OTEL_ENVIRONMENT: str = type_name
+    # Vazio: usa o IP detectado da máquina como host.name.
+    OTEL_HOST_NAME: str = ""
+
+    LOKI_ENABLED: bool = True
+    LOKI_URL: str = "http://192.168.0.213:3100/loki/api/v1/push"
+    LOKI_APP_NAME: str = "NomeAplicacaoFastAPI"
+    # Vazio: usa o IP detectado da máquina como tag host.
+    LOKI_HOST_NAME: str = ""
+    # True (padrão): LokiQueueHandler — envio assíncrono em thread de background.
+    # False: LokiHandler síncrono (bloqueia se o Loki estiver lento).
+    LOKI_ASYNC: bool = True
+
+    LOG_LEVEL: str = "INFO"
+    ENABLE_TEST_ROUTES: bool = False
+```
+
+`OTEL_SERVICE_NAME` e `LOKI_APP_NAME` são o nome BASE. As properties
+`service_name`/`loki_app_name` anexam, na ordem, o ambiente (`type_name`,
+quando `OTEL_APPEND_ENV=True`) e o último octeto do IP (quando
+`OTEL_APPEND_IP_SUFFIX=True`), produzindo o MESMO nome no Tempo e no Loki.
+`OTEL_HOST_NAME` e `LOKI_HOST_NAME` vazios usam o IP detectado da máquina.
+Ver seções "Separação de ambiente (type_name)" e "Identificação da instância
+por IP".
+
+---
+
+# Separação de ambiente (type_name)
+
+Quando a mesma API roda em homologação e produção, o ambiente deve aparecer no
+nome enviado ao Grafana/Loki e no `deployment.environment`, para separar os
+dados das duas instalações.
+
+A origem do ambiente é o campo `type_name`, já definido no `config` por ambiente
+(ex.: bloco `if DEBUG:` / `else:`):
+
+```python
+class Settings(BaseSettings):
+    DEBUG: bool = True
+
+    if DEBUG:
+        type_name: str = "homologacao"
+        # ... demais configs de homologação ...
+    else:
+        type_name: str = "producao"
+        # ... demais configs de produção ...
+
+    OTEL_ENVIRONMENT: str = type_name
+    OTEL_APPEND_ENV: bool = True
+```
+
+## Regras
+
+- `type_name` é a fonte única do ambiente; **não** repetir "homologacao"/
+  "producao" hardcoded em `OTEL_SERVICE_NAME` ou `LOKI_APP_NAME`.
+- `OTEL_ENVIRONMENT` recebe `type_name` e vai para `deployment.environment`
+  (resource) e para a tag `env` do Loki.
+- O ambiente entra no nome via property (`OTEL_APPEND_ENV`), nunca direto no
+  campo base, para que Tempo e Loki gerem nomes idênticos.
+- Nome final: `<base>-<ambiente>-<octeto_ip>` (ex.:
+  `TransportesAPI-homologacao-219`, `TransportesAPI-producao-220`).
+
+Errado (assimetria entre Tempo e Loki):
+
+```python
+OTEL_SERVICE_NAME: str = "TransportesAPI"            # sem ambiente
+LOKI_APP_NAME: str = f"TransportesAPI-{type_name}"   # com ambiente
+```
+
+Correto (base sem ambiente; sufixo nas properties):
+
+```python
+OTEL_SERVICE_NAME: str = "TransportesAPI"
+LOKI_APP_NAME: str = "TransportesAPI"
+OTEL_ENVIRONMENT: str = type_name
+```
+
+Exemplos válidos de nome base:
+
+```python
+OTEL_SERVICE_NAME: str = "RetencaoAPI"
+LOKI_APP_NAME: str = "RetencaoAPI"
+```
+
+```python
+OTEL_SERVICE_NAME: str = "TransportesAPI"
+LOKI_APP_NAME: str = "TransportesAPI"
+```
+
+Não deixar valores genéricos como:
+
+```python
+OTEL_SERVICE_NAME: str = "davi-api"
+LOKI_APP_NAME: str = "Nome aplicacao"
+```
+
+---
+
+# Identificação da instância por IP
+
+Quando a mesma API roda em mais de uma máquina, o nome enviado ao Grafana/Loki
+deve permitir distinguir qual instância gerou o trace/log.
+
+Para isso, detectar o IP local da máquina e anexar o último octeto (os 3
+últimos dígitos do IP) ao nome do serviço.
+
+Exemplo: numa máquina `192.168.0.213`, o serviço vira `NomeAplicacaoFastAPI-213`.
+
+## Regras
+
+- O nome base fica em `OTEL_SERVICE_NAME` / `LOKI_APP_NAME`.
+- O sufixo do IP é anexado quando `OTEL_APPEND_IP_SUFFIX=true`.
+- `host.name` (OTEL) e a tag `host` (Loki) usam o IP completo da máquina quando
+  `OTEL_HOST_NAME` / `LOKI_HOST_NAME` estiverem vazios.
+- A detecção de IP deve ser uma abstração reutilizável em `core/host_info.py`.
+- A detecção não pode quebrar o startup; usar fallback seguro.
+
+## core/host_info.py
+
+Criar um utilitário reutilizável para descobrir o IP e o sufixo:
+
+```python
+import socket
+from typing import Optional
+
+
+def get_local_ip() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+    finally:
+        sock.close()
+
+
+def get_ip_suffix(ip: Optional[str] = None) -> str:
+    ip = ip or get_local_ip()
+    parts = ip.split(".")
+    if len(parts) == 4 and parts[-1].isdigit():
+        return parts[-1]
+    digits = "".join(char for char in ip if char.isdigit())
+    return digits[-3:] if digits else "000"
+```
+
+O socket UDP não envia pacotes; serve apenas para o SO escolher a interface de
+saída e revelar o IP local.
+
+## Uso no config
+
+O IP deve ser detectado uma única vez (no import) e o nome final exposto por
+propriedades no `settings`, mantendo o nome base configurável por ambiente:
+
+```python
+from core.host_info import get_ip_suffix, get_local_ip
+
+LOCAL_IP = get_local_ip()
+IP_SUFFIX = get_ip_suffix(LOCAL_IP)
+
+
+class Settings(BaseSettings):
+    OTEL_SERVICE_NAME: str = "NomeAplicacaoFastAPI"
+    OTEL_APPEND_ENV: bool = True
+    OTEL_APPEND_IP_SUFFIX: bool = True
+    OTEL_ENVIRONMENT: str = type_name
+    OTEL_HOST_NAME: str = ""
+    LOKI_APP_NAME: str = "NomeAplicacaoFastAPI"
+    LOKI_HOST_NAME: str = ""
+
+    @property
+    def name_suffix(self) -> str:
+        parts: list[str] = []
+        if self.OTEL_APPEND_ENV and self.OTEL_ENVIRONMENT:
+            parts.append(self.OTEL_ENVIRONMENT)
+        if self.OTEL_APPEND_IP_SUFFIX:
+            parts.append(IP_SUFFIX)
+        return ("-" + "-".join(parts)) if parts else ""
+
+    @property
+    def service_name(self) -> str:
+        return f"{self.OTEL_SERVICE_NAME}{self.name_suffix}"
+
+    @property
+    def loki_app_name(self) -> str:
+        return f"{self.LOKI_APP_NAME}{self.name_suffix}"
+
+    @property
+    def host_name(self) -> str:
+        return self.OTEL_HOST_NAME or LOCAL_IP
+
+    @property
+    def loki_host_name(self) -> str:
+        return self.LOKI_HOST_NAME or LOCAL_IP
+```
+
+`core/telemetry.py` deve usar `settings.service_name` e `settings.host_name` no
+`Resource`. `core/logging_config.py` deve usar `settings.loki_app_name` e
+`settings.loki_host_name` nas tags do Loki.
+
+---
+
+# Dependências FastAPI
+
+Adicionar no `requirements.txt` ou `pyproject.toml`:
+
+```txt
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-requests
+opentelemetry-instrumentation-sqlalchemy
+opentelemetry-instrumentation-psycopg2
+opentelemetry-instrumentation-logging
+python-logging-loki
+```
+
+---
+
+# Estrutura obrigatória
+
+Criar ou adaptar:
+
+```text
+core/telemetry.py
+core/logging_config.py
+core/host_info.py
+```
+
+Se o projeto usa pasta `app`, usar:
+
+```text
+app/core/telemetry.py
+app/core/logging_config.py
+app/core/host_info.py
+```
+
+Não espalhar código de OpenTelemetry em routers, services, repositories ou models.
+
+---
+
+# core/logging_config.py
+
+Criar uma configuração de logging reutilizável.
+
+O `core/logging_config.py` também é responsável por garantir que todo log
+enviado ao Loki tenha a label `level`.
+
+Essa label é obrigatória para que a política de retenção do Loki consiga manter
+erros por 7 dias e logs comuns por 24h.
+
+Usar este modelo como base:
+
+```python
+import importlib.util
+import logging
+import logging.config
+from queue import Queue
+
+from core.config import settings
+
+LOG_FORMAT = (
+    "%(asctime)s %(levelname)s "
+    "[%(name)s] "
+    "[%(filename)s:%(lineno)d] "
+    "[trace_id=%(otelTraceID)s "
+    "span_id=%(otelSpanID)s "
+    "resource.service.name=%(otelServiceName)s] "
+    "- %(message)s"
+)
+
+
+class LokiLevelTagFilter(logging.Filter):
+    """Adiciona a label level em cada registro enviado ao Loki.
+
+    O Loki aplica retention_stream por labels, não pelo texto da mensagem.
+    Portanto, para manter erros por 7 dias, cada log precisa chegar com
+    level=error ou level=critical quando aplicável.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        current_tags = getattr(record, "tags", {}) or {}
+
+        record.tags = {
+            **current_tags,
+            "level": record.levelname.lower(),
+        }
+
+        return True
+
+
+def _loki_disponivel() -> bool:
+    return importlib.util.find_spec("logging_loki") is not None
+
+
+def _loki_tags() -> dict:
+    return {
+        "app": settings.loki_app_name,
+        "host": settings.loki_host_name,
+        "env": settings.OTEL_ENVIRONMENT,
+    }
+
+
+def _build_loki_handler_config(log_level: str) -> dict:
+    base = {
+        "level": log_level,
+        "url": settings.LOKI_URL,
+        "tags": _loki_tags(),
+        "filters": ["loki_level_tag"],
+        "auth": None,
+        "version": "1",
+    }
+    if settings.LOKI_ASYNC:
+        return {
+            **base,
+            "class": "logging_loki.LokiQueueHandler",
+            "queue": Queue(-1),
+        }
+    return {
+        **base,
+        "class": "logging_loki.LokiHandler",
+    }
+
+
+def get_logging_config() -> dict:
+    log_level = settings.LOG_LEVEL
+
+    handlers = {
+        "default": {
+            "level": log_level,
+            "formatter": "standard",
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+        }
+    }
+
+    root_handlers = ["default"]
+
+    if settings.LOKI_ENABLED and _loki_disponivel():
+        handlers["loki"] = _build_loki_handler_config(log_level)
+        root_handlers.append("loki")
+
+    config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "standard": {"format": LOG_FORMAT},
+        },
+        "handlers": handlers,
+        "loggers": {
+            "": {
+                "handlers": root_handlers,
+                "level": log_level,
+                "propagate": False,
+            },
+            "uvicorn": {
+                "handlers": root_handlers,
+                "level": log_level,
+                "propagate": False,
+            },
+            "uvicorn.access": {
+                "handlers": root_handlers,
+                "level": log_level,
+                "propagate": False,
+            },
+            "uvicorn.error": {
+                "handlers": root_handlers,
+                "level": log_level,
+                "propagate": False,
+            },
+        },
+    }
+
+    if settings.LOKI_ENABLED and _loki_disponivel():
+        config["filters"] = {
+            "loki_level_tag": {
+                "()": LokiLevelTagFilter,
+            },
+        }
+
+    return config
+
+
+def setup_logging() -> None:
+    logging.config.dictConfig(get_logging_config())
+```
+
+Nunca usar comentário inválido dentro de dicionário Python.
+
+Errado:
+
+```python
+"app": "Nome aplicacao", -- mudar
+```
+
+Correto:
+
+```python
+"app": settings.loki_app_name,  # valor vindo do config
+```
+
+Errado para retenção:
+
+```python
+"tags": {
+    "app": settings.loki_app_name,
+    "host": settings.loki_host_name,
+    "env": settings.OTEL_ENVIRONMENT,
+}
+```
+
+Correto para retenção (assíncrono — padrão):
+
+```python
+"class": "logging_loki.LokiQueueHandler",
+"queue": Queue(-1),
+"tags": {
+    "app": settings.loki_app_name,
+    "host": settings.loki_host_name,
+    "env": settings.OTEL_ENVIRONMENT,
+},
+"filters": ["loki_level_tag"],
+```
+
+Correto para retenção (síncrono — apenas quando `LOKI_ASYNC=False`):
+
+```python
+"class": "logging_loki.LokiHandler",
+"tags": {
+    "app": settings.loki_app_name,
+    "host": settings.loki_host_name,
+    "env": settings.OTEL_ENVIRONMENT,
+},
+"filters": ["loki_level_tag"],
+```
+
+A label `level` não deve ser fixa dentro de `tags`, porque cada registro pode ter
+um nível diferente. Ela deve ser adicionada dinamicamente pelo filtro
+`LokiLevelTagFilter`.
+
+---
+
+# core/telemetry.py
+
+Criar a configuração base do OpenTelemetry.
+
+Usar este modelo como base:
+
+```python
+import logging
+
+from fastapi import FastAPI
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.logging import LoggingInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+from core.config import settings
+from core.logging_config import LOG_FORMAT
+
+logger = logging.getLogger(__name__)
+
+_engines_instrumentados: set[int] = set()
+
+
+def setup_logging_instrumentation() -> None:
+    LoggingInstrumentor().instrument(
+        set_logging_format=True,
+        logging_format=LOG_FORMAT,
+    )
+
+
+def setup_base_telemetry() -> None:
+    """Deve rodar ANTES de setup_logging_instrumentation() para que o
+    service.name (do resource) seja capturado pelo record factory dos logs."""
+    if not settings.OTEL_ENABLED:
+        return
+
+    endpoint = settings.OTEL_EXPORTER_OTLP_ENDPOINT.rstrip("/")
+
+    resource = Resource.create(
+        {
+            "service.name": settings.service_name,
+            "deployment.environment": settings.OTEL_ENVIRONMENT,
+            "host.name": settings.host_name,
+        }
+    )
+
+    provider = TracerProvider(resource=resource)
+    exporter = OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces")
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+
+    HTTPXClientInstrumentor().instrument()
+
+
+def log_telemetry_status() -> None:
+    """Chamar após setup_logging()."""
+    if not settings.OTEL_ENABLED:
+        logger.info("OpenTelemetry desativado via OTEL_ENABLED.")
+        return
+
+    endpoint = settings.OTEL_EXPORTER_OTLP_ENDPOINT.rstrip("/")
+    logger.info(
+        "OpenTelemetry ativo | service=%s | host=%s | ip=%s | env=%s | endpoint=%s/v1/traces",
+        settings.service_name,
+        settings.host_name,
+        settings.local_ip,
+        settings.OTEL_ENVIRONMENT,
+        endpoint,
+    )
+
+
+def instrument_fastapi(app: FastAPI) -> None:
+    if not settings.OTEL_ENABLED:
+        return
+
+    FastAPIInstrumentor.instrument_app(app)
+
+
+def instrument_sqlalchemy(engine) -> None:
+    if not settings.OTEL_ENABLED:
+        return
+
+    # Engines assíncronos (asyncpg) expõem sync_engine.
+    target = getattr(engine, "sync_engine", engine)
+    if id(target) in _engines_instrumentados:
+        return
+
+    SQLAlchemyInstrumentor().instrument(engine=target)
+    _engines_instrumentados.add(id(target))
+```
+
+Use `requests`/`psycopg2` apenas se o projeto os usar; em projetos com `httpx` e
+`asyncpg`, instrumentar `HTTPXClientInstrumentor` e o `sync_engine` do SQLAlchemy.
+
+## Atenção ao set_logging_format por versão
+
+A injeção de `otelTraceID`/`otelSpanID`/`otelServiceName` no `LogRecord` depende
+da versão do `opentelemetry-instrumentation-logging`.
+
+Em versões recentes, com `set_logging_format=False` o record factory vira no-op
+e o formatter quebra com `KeyError: 'otelTraceID'`. Por isso, quando houver
+`LOGGING_CONFIG`/`dictConfig` próprio, ative a correlação passando o NOSSO
+`LOG_FORMAT`:
+
+```python
+LoggingInstrumentor().instrument(set_logging_format=True, logging_format=LOG_FORMAT)
+```
+
+O `setup_logging()` (dictConfig) aplicado em seguida continua sendo a fonte final
+do formato e dos handlers. Não deixar o OpenTelemetry sobrescrever o formato com
+o default dele.
+
+---
+
+# main.py FastAPI
+
+No `main.py`, respeitar esta ordem:
+
+```python
+import logging
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from opentelemetry import trace
+
+from core.config import settings
+from core.logging_config import setup_logging
+from core.telemetry import (
+    instrument_fastapi,
+    instrument_sqlalchemy,
+    log_telemetry_status,
+    setup_base_telemetry,
+    setup_logging_instrumentation,
+)
+
+
+# Ordem da observabilidade:
+# 1) tracer provider/exporter (define service.name no resource)
+# 2) instrumentar logging (captura service.name e injeta trace_id/span_id)
+# 3) dictConfig (handlers stdout + Loki)
+# 4) logar o status já formatado.
+setup_base_telemetry()
+setup_logging_instrumentation()
+setup_logging()
+
+logger = logging.getLogger(settings.service_name)
+log_telemetry_status()
+
+app = FastAPI(title=settings.OTEL_SERVICE_NAME)
+
+instrument_fastapi(app)
+# instrument_sqlalchemy(engine)  # se o projeto usar SQLAlchemy
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(
+        "Erro não tratado na rota %s %s",
+        request.method,
+        request.url.path,
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Erro interno do servidor"},
+    )
+
+
+if settings.ENABLE_TEST_ROUTES:
+
+    @app.get("/teste-erro-loki")
+    def teste_erro_loki():
+        raise Exception("Teste de erro para Loki")
+
+    @app.get("/telemetry-test")
+    def telemetry_test():
+        tracer = trace.get_tracer(__name__)
+
+        with tracer.start_as_current_span("teste-manual-opentelemetry") as span:
+            span.set_attribute("app.name", settings.service_name)
+            span.set_attribute("test.type", "manual")
+
+            return {
+                "status": "ok",
+                "message": "Trace manual gerado",
+            }
+```
+
+Se o projeto já possui `app = FastAPI(...)`, não criar outro app. Adaptar o existente.
+
+Se usar routers, manter os `include_router` existentes.
+
+---
+
+# Handler global de exceções
+
+Sempre adicionar handler global para FastAPI, caso ainda não exista.
+
+Não retornar detalhes internos da exception em produção.
+
+Errado:
+
+```python
+content={"detail": str(exc)}
+```
+
+Correto:
+
+```python
+content={"detail": "Erro interno do servidor"}
+```
+
+O erro detalhado deve ir para log/Loki com:
+
+```python
+logger.exception(...)
+```
+
+---
+
+# Rotas de teste
+
+Rotas de teste só podem existir com o campo do config:
+
+```python
+ENABLE_TEST_ROUTES: bool = True
+```
+
+E o gate no `main.py`:
+
+```python
+if settings.ENABLE_TEST_ROUTES:
+    ...
+```
+
+Nunca deixar `/teste-erro-loki` ativo em produção.
+
+---
+
+# SQLAlchemy
+
+Se o projeto usa SQLAlchemy, instrumentar o `engine`.
+
+Exemplo:
+
+```python
+from core.telemetry import instrument_sqlalchemy
+from core.database import engine
+
+instrument_sqlalchemy(engine)
+```
+
+Não duplicar instrumentação do engine.
+
+---
+
+# Validações obrigatórias
+
+Após implementar, validar:
+
+1. A aplicação sobe sem erro.
+2. Logs continuam aparecendo no terminal.
+3. Ao subir, aparece log parecido com (nome base + ambiente + sufixo do IP):
+
+```text
+OpenTelemetry ativo | service=RetencaoAPI-producao-213 | host=192.168.0.213 | ip=192.168.0.213 | env=producao | endpoint=http://192.168.0.213:4318/v1/traces
+```
+
+4. Ao acessar uma rota dentro de uma requisição, os logs têm valores reais:
+
+```text
+trace_id=<valor_real> span_id=<valor_real> resource.service.name=RetencaoAPI-producao-213
+```
+
+5. Não deve ficar assim dentro de uma requisição:
+
+```text
+trace_id=0 span_id=0 resource.service.name=
+```
+
+6. No Grafana Tempo, o serviço aparece em:
+
+```text
+Service Name = RetencaoAPI-producao-213
+```
+
+7. No Loki, filtrar por:
+
+```logql
+{app="RetencaoAPI-producao-213"}
+```
+
+8. Validar se a label `level` está chegando no Loki:
+
+```logql
+{app="RetencaoAPI-producao-213", level=~"(?i)(info|warning|error|critical)"}
+```
+
+9. Para erro, validar pela label `level`:
+
+```logql
+{app="RetencaoAPI-producao-213", level=~"(?i)(error|critical)"}
+```
+
+10. Para erro não tratado, validar a mensagem e a label:
+
+```logql
+{app="RetencaoAPI-producao-213", level=~"(?i)(error|critical)"} |= "Erro não tratado"
+```
+
+11. A consulta abaixo não deve ser usada como base para retenção, pois procura
+erro no texto e não em label:
+
+```logql
+{app="RetencaoAPI-producao-213"} |= "ERROR"
+```
+
+---
+
+# Regras de qualidade
+
+- Não duplicar `app = FastAPI`.
+- Não duplicar `dictConfig`.
+- Não duplicar `LoggingInstrumentor`.
+- Não duplicar `FastAPIInstrumentor.instrument_app(app)`.
+- Não hardcodar nome da aplicação fora do `config`.
+- Não hardcodar host da aplicação fora do `config`.
+- Não usar `/v1/traces` no valor de `OTEL_EXPORTER_OTLP_ENDPOINT` do `config`.
+- Não usar `http://tempo:3200` na aplicação.
+- Ler configuração sempre de `settings`, nunca de `os.getenv` direto.
+- Não quebrar o startup se Loki ou Tempo estiverem indisponíveis.
+- Não expor stack trace ao cliente.
+- Não deixar endpoint de teste ativo em produção.
+- Todo log enviado ao Loki deve conter a label dinâmica `level`.
+- Não configurar retenção do Loki baseada em texto do log; usar labels.
+- Não colocar `level` como tag fixa no handler do Loki.
+- Preferir `LOKI_ASYNC=True` com `LokiQueueHandler` em produção/homologação.
+- Não usar `LokiHandler` síncrono em produção sem motivo (bloqueia requests).
+- Manter as configurações no `config` (`core/config.py`).
+- Atualizar dependências.

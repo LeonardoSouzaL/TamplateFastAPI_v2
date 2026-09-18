@@ -1,0 +1,36 @@
+---
+description: Bag do técnico — location via auth_app.gai_id a partir do created_by (uid).
+globs: "services/technician_bag.py,services/auth_app.py,models/auth_app_model.py,schemas/technician_bag_schema.py"
+alwaysApply: false
+---
+
+# Bag — location do técnico via auth_app
+
+## Regra
+
+No `POST /api/v1/items/bag/{order_number}/serials`:
+
+1. `created_by` é o **`auth_app.uid`** (string numérica, ex.: `"1588"`).
+2. Se `to_location_id` vier omitido ou `0`, o backend resolve `auth_app.gai_id` e usa como `to_location_id` do movimento/item.
+3. Se `to_location_id` vier preenchido (> 0), esse valor prevalece (não consulta `auth_app` para location).
+4. `order_origin_id` / locations com valor `0` são tratados como ausentes (`NULL`).
+
+## Erros esperados
+
+| Situação | HTTP |
+| -------- | ---- |
+| `created_by` vazio | 422 |
+| `created_by` não numérico (sem `to_location_id`) | 422 |
+| uid não existe em `auth_app` | 404 |
+| técnico sem `gai_id` | 422 |
+
+## Camadas
+
+- Model: `models/auth_app_model.py` (somente leitura; **não** mapear/expor senha).
+- CRUD: `crud/crud_auth_app.py` → `get_by_uid`.
+- Service: `AuthAppService.resolve_gai_id_by_created_by`.
+- Orquestração: `TechnicianBagService.add_serial`.
+
+## Segurança
+
+Não versionar nem expor o campo `password`/`pwd` de `auth_app` em schemas ou logs.

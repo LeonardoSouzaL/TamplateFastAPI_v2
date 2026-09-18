@@ -1,0 +1,82 @@
+---
+description: Tabela de versionamento Alembic por projeto (alembic_version_{PROJECT_PREFIX}) para bancos compartilhados.
+globs: "alembic/**/*.py,alembic.ini,core/**/*config*.py,core/example-config.py"
+alwaysApply: false
+---
+
+# Alembic — tabela de versionamento por projeto
+
+Quando vários projetos FastAPI usam Alembic no **mesmo banco PostgreSQL**, cada um deve ter sua própria tabela de controle de revisions. O padrão default `alembic_version` causa conflito de versionamento entre APIs.
+
+## Contexto deste projeto (stock-api)
+
+Já implementado: `alembic-hg/env.py` e `alembic-prod/env.py` usam `VERSION_TABLE = "alembic_version_stock"` (setup duplo homolog/prod, com `alembic-hg.ini` e `alembic-prod.ini`). Manter esse nome de tabela; não voltar ao default `alembic_version`.
+
+## Regra obrigatória
+
+Todo projeto novo (ou setup inicial do Alembic) deve usar:
+
+```text
+alembic_version_{PROJECT_PREFIX}
+```
+
+Exemplo: `PROJECT_PREFIX=exemplo_leo` → tabela `alembic_version_exemplo_leo`.
+
+## Config (`core/config.py` / `core/example-config.py`)
+
+Adicionar campo único por projeto:
+
+```python
+PROJECT_PREFIX: str = "exemplo_leo"  # snake_case, único na organização
+
+@property
+def alembic_version_table(self) -> str:
+    return f"alembic_version_{self.PROJECT_PREFIX}"
+```
+
+Requisitos do `PROJECT_PREFIX`:
+
+- apenas `a-z`, `0-9` e `_`;
+- minúsculas;
+- único entre projetos que compartilham o mesmo banco;
+- **não** usar o nome default `alembic_version` nem deixar vazio.
+
+## `alembic/env.py`
+
+Passar `version_table` em **ambos** os modos (`offline` e `online`):
+
+```python
+from core.config import settings
+
+context.configure(
+    # ... demais opções ...
+    target_metadata=target_metadata,
+    version_table=settings.alembic_version_table,
+)
+```
+
+## Proibido
+
+- Deixar `version_table` omitido (cai no default `alembic_version`).
+- Hardcodar o nome da tabela em `env.py` sem ler de `settings`.
+- Reutilizar o mesmo `PROJECT_PREFIX` em dois projetos no mesmo banco.
+
+## Ao inicializar Alembic em projeto novo
+
+1. Definir `PROJECT_PREFIX` no config antes de `alembic upgrade head`.
+2. Configurar `version_table` no `env.py` conforme acima.
+3. Documentar o prefixo no README do projeto.
+
+## Consulta no banco
+
+```sql
+SELECT * FROM alembic_version_exemplo_leo;
+```
+
+## Migração de projeto legado
+
+Se o projeto já usava `alembic_version`:
+
+1. Anotar `version_num` atual.
+2. Configurar `PROJECT_PREFIX` e `version_table` no `env.py`.
+3. Renomear a tabela ou inserir o registro na nova tabela antes do próximo `upgrade`.

@@ -1,0 +1,52 @@
+---
+description: Regras de totais de OS LastMile por status da ordem (visão LastMile).
+globs: "{api/api_v1/endpoints/lastmile_os_status.py,services/lastmile_os_status_service.py,crud/crud_lastmile_os_metrics.py,schemas/lastmile_os_status_schema.py,models/service_order_model.py}"
+alwaysApply: false
+---
+
+# Rule: OS LastMile por status (somente leitura)
+
+## Escopo
+
+- `GET /api/v1/lastmile/orders/by-status`
+- Service `LastMileOsStatusService`, CRUD `CRUDLastMileOsMetrics`
+- Fato: `service_order.order_state_id` → `status_equipament`
+
+Não misturar com os KPIs de **viagem** (`pa-summary` / `metrics` / rule `201`).
+
+## Regras obrigatórias
+
+- Somente leitura. Sem `create`/`update`/`remove`, sem migration, sem `create_all`.
+- Unidade = OS (`service_order`), não `order_travels`.
+- **PENDING** = `UPPER(status_equipament.type) = 'PENDING'` (`PENDING` e `Pending`). Não incluir `ON ROUTE`, `NEW`, `RESCHEDULING`, `COLLECTED`, `PENDING_URA`.
+- **Aberto / encerrado** = `status_equipament.finished` (`false` / `true`). Aberto não é pendente.
+- Não filtrar `status.type_id = order_type_id`.
+- Sem `order_type` → padrões `LASTMILE_OS_TYPE_PATTERNS` com **ILIKE**: `LASTMILE_COLLECT`, `LASTMILE_NORMAL`, `LASTMILE_DESINSTAL%`, `LASTMILE_RETIRADA%` (ids duplicados de desinstalação e retirada entram pelo nome).
+- CSV `order_type` informado = `type IN (...)` exato. CSV vazio → totais 0.
+- `status` CSV case-insensitive; combina com `finished` em AND.
+- `designation_id` = `service_order.designation_id` (PA da OS).
+- `cliente_id` = `service_order.client_id`.
+- `data_inicial` / `data_final` = `service_order.created_at` `>=` / `<=` (opcionais). Entram na visão (também em `universe_total`). Não usar data da viagem.
+- Agregar no SQL (`GROUP BY UPPER(type)` + `COUNT`). Não hidratar OS.
+
+## Resposta
+
+- `total` = OS no recorte filtrado
+- `universe_total` = OS da visão sem `status`/`finished` (ainda aplica tipo/cliente/PA/datas)
+- `by_status` / `by_order_type` no recorte filtrado
+
+## Erros esperados
+
+| Código | Situação |
+| ------ | -------- |
+| 500 | Exceção não tratada (handler global, sem stack ao cliente) |
+
+## Testes esperados
+
+- Sem filtro: `total == universe_total`
+- `status=PENDING` não conta em rota / NEW
+- `finished=false` soma abertos
+- `PENDING` + `finished=true` → recorte 0
+- Default não usa `LASTMILE_DELIVERY`
+- CSV `order_type` vazio → 0 sem consultar banco
+- `data_inicial` / `data_final` filtram `service_order.created_at` na visão e no recorte

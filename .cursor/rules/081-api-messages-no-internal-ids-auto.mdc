@@ -1,0 +1,31 @@
+---
+description: Mensagens de operador (detail/message) sem PKs internos nos fluxos Supplies, Chamados Indoor e Recebimento de carga.
+globs: "{services/stock_request_service.py,services/stock_request_label.py,services/supply_movement_service.py,services/supply_service.py,services/inbound_receipt_service.py,api/api_v1/endpoints/supplies.py,api/api_v1/endpoints/stock_requests.py}"
+alwaysApply: false
+---
+
+# Mensagens sem IDs internos
+
+Em **Supplies**, **Chamados Indoor** e **Recebimento de carga**, textos que o operador vê (`HTTPException.detail` string e `message` de 2xx) **não** interpolam PK numérico (`request_id`, `product_id`, `movement_id`, `package_id`, `item.id`, `supply_id`).
+
+## Pode
+
+- Campos JSON `id` / `product_id` nos response models.
+- Serial, SKU, protocolo `SR########`, número de romaneio, depósito, status (`OPEN`, `IN_DEPOT`).
+- Quantidade e saldo no `message` do `POST /supplies/movements`.
+- IDs em logs (`logger.info` / `exception`).
+- `detail` objeto (424, `incomplete_types`); só a chave de texto (`error`/`message`) segue esta regra.
+
+## Exemplos
+
+```text
+# Errado
+"Chamado 999 não encontrado."
+"Saldo insuficiente para product_id=55 em location_id=820. Disponível=10, solicitado=20."
+
+# Correto
+"Chamado não encontrado."
+"Saldo insuficiente. Disponível=10, solicitado=20."
+```
+
+Toast do tipo `Movimento 21 registrado com sucesso` **não** deve ser montado na API. Se o Django concatenar `id` do JSON, o ajuste é no front.

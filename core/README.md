@@ -9,6 +9,10 @@ Ela deve conter código reutilizável que pode ser usado por endpoints, services
 core/
 ├── config.py
 ├── example-config.py
+├── host_info.py
+├── logging_config.py
+├── telemetry.py
+├── travel_route_date.py
 ├── filters.py
 ├── request.py
 ├── oauth2_client.py

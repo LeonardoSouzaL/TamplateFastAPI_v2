@@ -1,0 +1,13 @@
+---
+description: Workflow para o Agent executar tarefas maiores seguindo o padrão do projeto.
+globs: "**/*"
+alwaysApply: false
+---
+
+# Workflow para tarefas com Agent
+
+**Use a Skill `executar-tarefa-template-fastapi`** em `.cursor/skills/executar-tarefa-template-fastapi/SKILL.md`.
+
+Invoque quando criar módulos, refatorar endpoints, alterar models/schemas ou concluir features multi-arquivo.
+
+Resumo: Endpoint leve → Service (negócio) → CRUD (banco). Ao finalizar, listar arquivos alterados, regras aplicadas e comandos de teste.

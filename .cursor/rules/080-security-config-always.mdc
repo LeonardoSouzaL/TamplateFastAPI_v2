@@ -1,0 +1,68 @@
+---
+description: Regras globais de segurança, secrets, configurações e dados sensíveis.
+globs: "**/*"
+alwaysApply: true
+---
+
+# Segurança e configurações
+
+Nunca gerar, sugerir ou versionar credenciais reais.
+
+## Proibido hardcodar
+
+- senhas reais;
+- tokens reais;
+- API keys reais;
+- client secrets reais;
+- certificados reais;
+- chaves privadas;
+- strings de conexão reais com usuário/senha;
+- conteúdo real de `.env`;
+- credenciais de produção.
+
+## Use sempre
+
+- `settings` centralizado;
+- variáveis de ambiente;
+- `.env.example` com valores fictícios;
+- nomes claros para variáveis;
+- documentação das variáveis necessárias.
+
+## Exemplos permitidos
+
+Use valores fictícios como:
+
+```text
+EXTERNAL_API_KEY=changeme
+CLIENT_SECRET=your-client-secret
+DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/db
+```
+
+## Logs
+
+Não registrar em log:
+
+- token;
+- senha;
+- secret;
+- certificado;
+- header Authorization completo;
+- API key completa.
+
+Se necessário, mascarar:
+
+```text
+abcd****wxyz
+```
+
+## Certificados
+
+Quando o projeto usar mTLS, documentar caminhos esperados, mas não incluir arquivos reais:
+
+```text
+certs/client.crt
+certs/client.key
+certs/ca-bundle.pem
+```
+
+Adicionar esses caminhos ao `.gitignore` quando necessário.

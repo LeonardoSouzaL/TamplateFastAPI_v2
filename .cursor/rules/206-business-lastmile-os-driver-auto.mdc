@@ -1,0 +1,72 @@
+---
+description: Regras de totais de OS LastMile agrupados por técnico (auth_app) e ociosidade.
+globs: "{api/api_v1/endpoints/lastmile_os_driver.py,services/lastmile_os_driver_service.py,crud/crud_lastmile_os_driver_metrics.py,schemas/lastmile_os_driver_schema.py,models/auth_app_model.py}"
+alwaysApply: false
+---
+
+# Rule: OS LastMile por técnico (somente leitura)
+
+## Escopo
+
+- `GET /api/v1/lastmile/orders/by-driver` (endpoint **novo**)
+- Service `LastMileOsDriverService`, CRUD `CRUDLastMileOsDriverMetrics`
+- Fato: `driver_id` da viagem atual → `auth_app.uid` (`tecnico`)
+
+Não misturar com os KPIs de **viagem** (`pa-summary` / `metrics` / rule `201`), totais por status da OS (rule `202`), por PA (rule `203`) nem `driver-status-summary` (rule `204`). Não alterar `by-status` / `by-pa` / `by-client`.
+
+## Regras obrigatórias
+
+- Somente leitura. Sem `create`/`update`/`remove`, sem migration, sem `create_all`.
+- Unidade = OS (`service_order`), não `order_travels`.
+- Técnico = `driver_id` da viagem atual (`DISTINCT ON (order_id) ORDER BY id DESC`). Nome via `auth_app` depois da agregação (`uid`, `name`, `cod_base`, `nome_unidade`, `last_opening`). Sem senha.
+- Sem `order_type` → padrões `LASTMILE_OS_TYPE_PATTERNS` com **ILIKE**: `LASTMILE_COLLECT`, `LASTMILE_NORMAL`, `LASTMILE_DESINSTAL%`, `LASTMILE_RETIRADA%`.
+- CSV `order_type` informado = `type IN (...)` exato. CSV vazio → totais 0.
+- `cliente_id` = `service_order.client_id`.
+- `designation_id` = `service_order.designation_id` (PA da OS).
+- `driver_id` = uid da viagem atual (recorte; no máximo 1 item no ranking).
+- `data_inicial` / `data_final` = `service_order.created_at` `>=` / `<=` (opcionais). Não usar data da viagem.
+- Viagem atual e SLA compartilhados com `by-pa` / `by-client` em `crud/lastmile_os_sla.py`. Não divergir as expressões.
+- OS sem viagem ou `driver_id IS NULL` → `sem_tecnico_count` no response, **fora** de `items`.
+- Técnico com rota hoje e 0 OS no recorte **não entra** em `items`.
+- Agregar no SQL (`GROUP BY driver_id` + `COUNT FILTER`). Não hidratar OS. Não `SELECT *` em `auth_app`.
+
+## Ociosidade
+
+- Fonte: `auth_app.last_opening`. Não usar `last_login` nem `last_treatment`.
+- Porta: existe viagem LastMile da visão com `route_date` **hoje** em `America/Sao_Paulo`. Sem rota → não ocioso, `0`.
+- `last_opening` nulo (mesmo com rota) → não ocioso, `0`.
+- Carência: `LASTMILE_IDLE_GRACE_MINUTES` (50). `elapsed <= 50 min` → não ocioso. `elapsed > 50 min` → `ociosidade_segundos = elapsed - 50 min` (53 min parado → 180 s).
+- Cálculo no **service**, no momento da request. CRUD só devolve `last_opening` e se há rota hoje.
+
+## Resposta
+
+- `total` = soma de `chamado_count` dos `items` + `sem_tecnico_count`
+- `chamado_count = atraso_count + dentro_do_prazo_count + sem_prazo_count`
+- `by_status_viagem` = `UPPER(status_equipament.type)` da viagem atual
+- Rankings no mesmo GET, em memória, sem SQL extra: `ofensores` (top 10 com `atraso_count > 0`), `tecnico_ofensor` (primeiro ou null), `melhores` (top 10 com `dentro_do_prazo_count > 0`), `melhor_tecnico` (primeiro ou null), `ociosos` (top 10 com `ocioso` e `ociosidade_segundos > 0`), `tecnico_ocioso` (primeiro ou null). Ordenação por quantidade desc, empate `driver_uid` desc. Sem percentual.
+
+## Erros esperados
+
+| Código | Situação |
+| ------ | -------- |
+| 500 | Exceção não tratada (handler global, sem stack ao cliente) |
+
+## Testes esperados
+
+- Default não usa `LASTMILE_DELIVERY`
+- CSV `order_type` vazio → 0 sem consultar banco
+- `GROUP BY` em `driver_id`, não em `client_id` / `designation_id`
+- Lookup `auth_app.last_opening` sem senha
+- Sem rota hoje → não ocioso
+- `last_opening` nulo → não ocioso
+- 53 min parado → 180 s; 8 min / 4 min → 0
+- OS sem técnico → `sem_tecnico_count`, fora de `items`
+- Técnico só com rota e 0 OS no recorte não aparece
+- `tecnico_ofensor` é o max de atraso de um técnico, não o total
+- Top 10 corta; atraso/dentro/ociosidade 0 não entra no ranking
+- Empate usa o maior `driver_uid`
+- Filtro `driver_id` → no máximo 1 item
+
+## Fonte
+
+Spec LastMile OS por técnico 2026-09-18. Mesma visão e SLA do `by-client` (rule `205`), dimensão `latest_travel.driver_id` + ociosidade `auth_app.last_opening`.

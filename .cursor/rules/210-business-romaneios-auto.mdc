@@ -1,0 +1,135 @@
+---
+description: Regras de negócio para romaneios de reversa (v1 legado e v2).
+globs: "{services/romaneio.py,api/api_v1/endpoints/romaneio.py,api/api_v1/endpoints/romaneio_v2.py,schemas/romaneio_schema.py,schemas/romaneio_item_schema.py,models/romaneio_model.py,models/romaneio_item_model.py,crud/crud_romaneio.py,crud/crud_romaneio_item.py}"
+alwaysApply: false
+---
+
+# Rule: Romaneios (reversa)
+
+## Escopo
+
+- `services/romaneio.py` — `RomaneioItemService`, **`RomaneioService`**
+- `api/api_v1/endpoints/romaneio.py` (v1)
+- `api/api_v1/endpoints/romaneio_v2.py` (preferencial)
+- Schemas/models/CRUD de romaneio e romaneio_item
+
+## Regras obrigatórias
+
+1. **Novos fluxos** usam `/api/v2/romaneios`. Criação em v1 está `deprecated`; **v1 somente manutenção** até desligar.
+2. `romaneio_number` é gerado no banco (`before_insert`); integrações não inventam o número.
+3. Inserir item no romaneio só com `status_rom == STARTED`.
+4. Remover item do romaneio só com `status_rom == STARTED`; renumerar `kit_number` após delete.
+5. Item não pode estar em outro romaneio com status `STARTED`, `READY`, `COLLECTION_REQUESTED`, `AWAITING_COLLECTION` ou `DISPATCHED` (exceto já vinculado ao mesmo romaneio). **`READY` no enum** permanece ativo: no fluxo PA→CD é o **pós-`PACKING`** (`STARTED` → finish `PACKING` → `READY` → `COLLECTION_REQUEST` → …). **Deprecated/legado** = usar `READY` como fim de bipagem fora desse fluxo (ex.: integrador externo setando `READY` sem `PACKING`; fluxo antigo `RETURN` → `AWAITING_COLLECTION` sem passar por `PACKING`).
+6. **Resposta do finish**: `RomaneioFineshedResponse` deve retornar o **`status_rom` real** do romaneio após `advance_romaneio` e reload do banco.
+7. Falha no finish após `IN_PROCESSING`: romaneio → **`PROCESSING_ERROR`** + log retentável; permitir novo finish a partir de `PROCESSING_ERROR` (tipos com retentativa na tabela abaixo).
+8. Filtros de origem em v2 (extra-item, finish): `origin_name=arancia`, **`project_name=REVERSA`**, `client_id` do romaneio (e `stock_type` conforme fluxo, ex. `Aguardando Reversa`).
+9. **PA→CD logístico**: integradores chamam **`POST /v2/romaneios/finish/{n}`** → `RomaneioService.advance_romaneio`. Movement API direta é para recebimento/delivery/APP (rule `200`).
+
+## Fluxos principais
+
+### Criação v2
+
+`POST /api/v2/romaneios/` → resolve `client_name` → `RomaneioCreateV2` com `origin_id`, `destination_id`, `location_id`.
+
+### Inserção de item (v1 `insert-items`, v2 `POST .../insert-items/{romaneio_in}` ou service)
+
+1. Romaneio existe e `STARTED`.
+2. Serial em UPPER.
+3. Último movimento: serial + client + `IN_DEPOT`, tipo `IN`, excluir movimentos `ADJUST` na consulta.
+4. Último movimento deve ser entrada (`movement_type == IN`).
+5. Se já no mesmo romaneio, ignorar inserção; se em outro romaneio ativo (`STARTED`/`READY`/`COLLECTION_REQUESTED`/`AWAITING_COLLECTION`/`DISPATCHED`), **400**. Seriais duplicados podem existir no mundo físico — o bloqueio em romaneio ativo permanece válido (incidente 12.1).
+6. `kit_number` = quantidade de itens no mesmo `volume_number` + 1.
+
+### Consulta
+
+- Parser ID: se `romaneio_in.startswith('AR1')` → `id = int(romaneio_in[5:].lstrip('0'))`; senão `int(romaneio_in[3:].lstrip('0'))`.
+- v1: `location_id` obrigatório nas rotas GET documentadas.
+- `order_updated_by=true`: ordenar por `updated_at`, exibir produtos nos kits.
+
+### Finish v2 (`POST .../finish/{romaneio_number}`)
+
+Delega a **`RomaneioService.advance_romaneio`**.
+
+Tipos permitidos: **`PACKING`**, **`COLLECTION_REQUEST`**, **`COLLECTION_REQUEST_RECEIVED`**, **`COLLECTED`**, **`DELIVERED`**, **`PRE_RECEIVE`**, **`RECEIVE`**; legado: **`RETURN`**, **`TRANSFER`**.
+
+| movement_type | Pré-condição status_rom | Pós status_rom | Movimento interno? |
+| ------------- | ------------------------ | -------------- | ------------------ |
+| PACKING | STARTED, PROCESSING_ERROR | **READY** | Sim × todos (item → `READY_FOR_DELIVERY`) |
+| COLLECTION_REQUEST | READY, PROCESSING_ERROR | COLLECTION_REQUESTED | **Não** |
+| COLLECTION_REQUEST_RECEIVED | COLLECTION_REQUESTED | AWAITING_COLLECTION | Sim × todos |
+| COLLECTED | AWAITING_COLLECTION | DISPATCHED | Sim × todos |
+| DELIVERED | DISPATCHED | VALIDATION_PENDING | Sim × todos |
+| PRE_RECEIVE | VALIDATION_PENDING | PRE_RECEIVED | Sim × todos |
+| RECEIVE | PRE_RECEIVED, PROCESSING_ERROR | RECEIVED / **PARTIALLY_RECEIVED** | Sim × ck=True |
+| RETURN (legado) | STARTED, PROCESSING_ERROR | DISPATCHED | Sim × todos |
+| TRANSFER (legado) | STARTED, PROCESSING_ERROR | DISPATCHED | Sim × todos |
+
+Fluxo `advance_romaneio`:
+
+1. Validar tipo e transição pré/pós `status_rom`.
+2. Marcar romaneio `IN_PROCESSING` com `finished_by` / `finished_at`.
+3. Se gera movimento: listar itens (RECEIVE: filtrar `ck=True`); loop `MovementService.create_movement`; `update_rom_by_movement`.
+4. Se `COLLECTION_REQUEST`: chamar `TransportServiceOrderService.open_collection_request` **antes** de `set_romaneio_status` → `COLLECTION_REQUESTED` (rule `215`). Falha → `fail_romaneio_processing`.
+5. Se não gera movimento (ex.: `COLLECTION_REQUEST` após transporte OK): `set_romaneio_status` conforme mapa.
+6. Em falha: `fail_romaneio_processing` → **`PROCESSING_ERROR`** + log; re-lançar exceção.
+7. Recarregar romaneio e retornar `RomaneioFineshedResponse` com **`status_rom` real** e, para RECEIVE, **`receive_summary`** (`total_items`, `received_items`, `pending_items`).
+
+### CK / extra / remove-ck
+
+- `mark-ck`: exige `product_id` válido; pode atualizar produto do item; se já CK → WARNING.
+- `extra-item`: cria `IN` se item não existe; `KIT-EXTRA`, `VOLUME 0`, `extra=True`, `ck=True`.
+- `remove-ck`: itens `extra=True` são **removidos** do romaneio; demais apenas `ck=False`.
+
+## Status e transições
+
+Enum `RomaneioStatus` (schema): `STARTED`, **`READY`** (pós-finish **`PACKING`** no PA→CD; também bloqueio em insert-items), **`COLLECTION_REQUESTED`**, `AWAITING_COLLECTION`, `DISPATCHED`, `VALIDATION_PENDING`, `PRE_RECEIVED`, `RECEIVED`, **`PARTIALLY_RECEIVED`**, `IN_PROCESSING`, **`PROCESSING_ERROR`**, `CANCELLED`.
+
+Filtro de listagem v2: aceita todos os valores do enum; usar **`CANCELLED`** (não `CANCELADO`).
+
+### Formato `romaneio_number` (`before_insert`)
+
+- Cliente **Cielo** (`is_cielo_client` / GAI `nome=CIELO`, group `arancia_client`): prefixo legado **`AR105`** + id interno do romaneio com 10 dígitos (não usar o id numérico do GAI no prefixo).
+- Demais clientes: `AR{client_id}` + id com 8 dígitos (`client_id` = id do GAI contratante).
+- Na **criação**, `client_id` no payload pode ser o id GAI ou o alias legado **`1`** (CIELO); persistir sempre o id real do GAI (`ClientGaiService.resolve_client_id`).
+
+## Validações
+
+- Finish com tipo inválido → **400**.
+- Romaneio não encontrado → **404**.
+- RECEIVE sem `PRE_RECEIVED` (ou `PROCESSING_ERROR` retentativa) → **400**.
+
+## Integrações/eventos
+
+- Finish PA→CD acionado por PA, transportadora ou CD; resposta reflete `status_rom` real pós-movimentos.
+- **`COLLECTION_REQUEST`**: integração síncrona com API Transportes (abertura OS) — rule `215`.
+- Movimentos gerados no finish delegam a `MovementService` (rule `200`).
+
+## Erros esperados
+
+| Situação | HTTP |
+| -------- | ---- |
+| Romaneio não encontrado | 404 |
+| Romaneio inativo para inserção | 400 |
+| Item não elegível (serial/cliente/status/movimento) | 404 / 400 |
+| Item em outro romaneio ativo | 400 |
+| Finish com status_rom inválido | 400 |
+| Falha abertura OS Transportes (`COLLECTION_REQUEST`) | 424 (+ rom `PROCESSING_ERROR`) |
+| Origem não encontrada (extra-item) | 404 |
+
+## Testes esperados
+
+- Inserção só em `STARTED`; bloqueio romaneio ativo em outro romaneio (inclui logística PA→CD).
+- Finish RECEIVE só itens `ck=True`; pré-condição `PRE_RECEIVED`; parcial → `PARTIALLY_RECEIVED` + `receive_summary`.
+- Cadeia PA→CD: PACKING → COLLECTION_REQUEST → COLLECTION_REQUEST_RECEIVED → COLLECTED → DELIVERED → PRE_RECEIVE → RECEIVE.
+- COLLECTED: `AWAITING_COLLECTION` → `DISPATCHED`.
+- RETURN legado: rom → `DISPATCHED` (não `AWAITING_COLLECTION`).
+- Resposta finish com `status_rom` real após `advance_romaneio`.
+- Filtro listagem v2 aceita `CANCELLED`.
+- Geração de número AR* por client_id.
+
+## Fonte da regra
+
+- Código: `services/romaneio.py`, `romaneio_v2.py`, `romaneio.py`, `models/romaneio_model.py`
+- Decisões: `.cursor/business-rules/decisions.md` (2026-06-01)
+- Eventos de ciclo de vida: `record_romaneio_event` (rule `250`) — obrigatório em mutações de romaneio
+- **Pendência explícita (catálogo de status):** migrar `_ADVANCE_ROMANEIO_TRANSITIONS` / mapas finish e `_ACTIVE_ROMANEIO_BLOCKING_STATUSES` para `process_code=PA_CD` nas tabelas `logistic_stock_romaneio_status` + `_transition`. Nesta leva Claro Indoor só seeda/valida **INDOOR**. Ver `.cursor/business-rules/pending-questions.md` (2026-07-23) e `docs/claro-indoor-spec.md` §3.

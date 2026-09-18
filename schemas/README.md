@@ -7,7 +7,8 @@ A pasta `schemas/` contém os schemas Pydantic usados para entrada e saída de d
 ```text
 schemas/
 ├── __init__.py
-└── car_schema.py
+├── car_schema.py
+└── lastmile_dashboard_schema.py
 ```
 
 ## Responsabilidade

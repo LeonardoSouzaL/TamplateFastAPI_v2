@@ -1,0 +1,62 @@
+---
+description: Padrão para endpoints FastAPI leves, organizados e conectados aos services.
+globs: "api/**/*.py,main.py"
+alwaysApply: false
+---
+
+# Endpoints FastAPI
+
+Endpoints devem ser simples e focados em HTTP.
+
+## O endpoint deve fazer
+
+- Declarar rota com `APIRouter`.
+- Declarar `response_model` sempre que possível.
+- Receber dependências com `Annotated` + `Depends` (alias `DbDep` para sessão — rule [`015-db-session-auto.mdc`](015-db-session-auto.mdc)).
+- Receber payload com schema Pydantic.
+- Chamar uma função/método da camada `services/`.
+- Retornar o resultado do service.
+- Usar `Query`, `Path` e `Body` quando melhorar a documentação da API.
+- Ter docstring curta explicando a finalidade da rota.
+
+## O endpoint não deve fazer
+
+- Regra de negócio pesada.
+- Query direta no banco quando existir service.
+- Chamada direta para API externa.
+- Normalizações complexas.
+- Loops de processamento de domínio.
+- Tratamento de duplicidade.
+- Transições de status.
+- Montagem extensa de payload.
+
+## Padrão recomendado
+
+```python
+from api.deps import DbDep
+
+@router.post("/", response_model=ItemResponse, status_code=201)
+async def create_item(
+    *,
+    db: DbDep,
+    payload: ItemCreate,
+) -> Item:
+    """
+    Cria um novo item.
+    """
+    return await item_service.create_item(db=db, payload=payload)
+```
+
+## Tratamento de erro
+
+- Preferir lançar `HTTPException` no service quando o erro for regra de negócio.
+- O endpoint pode lançar erro quando for algo puramente HTTP, como permissão ou dependência inválida.
+- Não usar `except Exception` genérico no endpoint sem necessidade.
+
+## Logs
+
+Pode usar log no endpoint para início/fim de operação, mas logs de regra de negócio devem ficar no service.
+
+## Imports
+
+Evitar imports não utilizados. Não importar `crud` no endpoint se a rota chama service.

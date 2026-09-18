@@ -1,0 +1,69 @@
+---
+description: Padrão para schemas Pydantic e models SQLAlchemy.
+globs: "schemas/**/*.py,models/**/*.py"
+alwaysApply: false
+---
+
+# Schemas e Models
+
+Mantenha separação clara entre `schemas/` e `models/`.
+
+## Models SQLAlchemy
+
+Models ficam em `models/` e representam tabelas do banco.
+
+Devem conter:
+
+- `__tablename__`
+- colunas
+- tipos
+- constraints
+- relacionamentos
+- índices quando necessário
+
+Não devem conter:
+
+- regra de negócio complexa;
+- chamada de API externa;
+- lógica de endpoint;
+- validações HTTP.
+
+## Schemas Pydantic
+
+Schemas ficam em `schemas/` e representam entrada/saída da API.
+
+Padrão recomendado:
+
+```python
+from pydantic import BaseModel, ConfigDict
+
+class ItemBase(BaseModel):
+    name: str | None = None
+
+class ItemCreate(ItemBase):
+    name: str
+
+class ItemUpdate(ItemBase):
+    pass
+
+class ItemResponse(ItemBase):
+    id: int
+    model_config = ConfigDict(from_attributes=True)
+```
+
+## Nomes recomendados
+
+- `ModelBase`
+- `ModelCreate`
+- `ModelUpdate`
+- `ModelResponse`
+- `ModelInDbBase`, se o projeto já usa esse padrão
+- `Payload...`, quando for payload externo ou fluxo específico
+
+## Regras
+
+- Campos obrigatórios no `Create`.
+- Campos opcionais no `Update`.
+- Resposta deve ter `model_config = ConfigDict(from_attributes=True)` em Pydantic v2.
+- Não expor campos sensíveis no response.
+- Não misturar schema de payload externo com model interno quando os formatos forem diferentes.

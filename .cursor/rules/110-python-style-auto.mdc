@@ -1,0 +1,48 @@
+---
+description: Estilo geral para código Python no projeto.
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Estilo Python
+
+## Regras gerais
+
+- Usar tipagem sempre que possível.
+- Preferir nomes claros e explícitos.
+- Evitar funções muito longas.
+- Evitar imports não utilizados.
+- Evitar `pass` silencioso em blocos importantes.
+- Evitar `except Exception` genérico sem tratamento claro.
+- Usar `async`/`await` corretamente em código assíncrono.
+- Não misturar responsabilidades na mesma função.
+
+## Imports
+
+Organizar imports em grupos:
+
+1. biblioteca padrão;
+2. bibliotecas externas;
+3. imports internos do projeto.
+
+## Async
+
+Se a função chama método assíncrono, ela deve ser `async` e usar `await`.
+
+Não usar biblioteca síncrona bloqueante dentro de fluxo async sem necessidade.
+
+## Erros
+
+Mensagens de erro devem ser claras e úteis:
+
+```python
+raise HTTPException(status_code=404, detail="Registro não encontrado.")
+```
+
+## Comentários
+
+Comentários devem explicar decisões e regras, não repetir o óbvio.
+
+## Logs
+
+Usar logs para eventos importantes, mas sem expor dados sensíveis.

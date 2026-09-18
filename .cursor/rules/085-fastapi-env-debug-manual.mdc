@@ -1,0 +1,15 @@
+---
+description: Rule manual — FastAPI start manual, .env, perfis homolog/prod e debug Cursor (launch.json).
+globs: "{.env,.env.example,pytest.ini,main.py,core/config.py,core/example-config.py,.vscode/launch.json,README.md}"
+alwaysApply: false
+---
+
+# Rule manual: FastAPI — `.env`, start manual e debug
+
+**Use a Skill `migrar-env-debug-fastapi`** em `.cursor/skills/migrar-env-debug-fastapi/SKILL.md`.
+
+Invoque com `@085-fastapi-env-debug-manual` ao migrar ambiente e debug em projetos com **uvicorn** ou `python main.py`.
+
+Complementa `080-security-config-always.mdc`: secrets no `.env`, nunca versionados.
+
+Templates: `docs/cursor/templates/launch.json`, `docs/cursor/templates/env-example-header.env`.

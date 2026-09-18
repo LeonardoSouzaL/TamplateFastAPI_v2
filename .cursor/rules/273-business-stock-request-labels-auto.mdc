@@ -1,0 +1,46 @@
+---
+description: Etiquetas A4 dos volumes dos Chamados Indoor (PDF gerado na hora).
+globs: "{services/stock_request_label.py,api/api_v1/endpoints/stock_requests.py,schemas/stock_request_schema.py,crud/crud_stock_request.py,tests/services/test_stock_request_label.py}"
+alwaysApply: false
+---
+
+# Rule: Etiquetas de volumes (Chamados Indoor)
+
+## Escopo
+
+- `GET /api/v1/stock-requests/{id}/labels` — JSON `{ url, filename, protocol_number, volumes }`
+- `GET /api/v1/stock-requests/{id}/labels/file` — PDF A4 (`application/pdf`)
+- Service `services/stock_request_label.py`
+- **Não** confundir com Claro Indoor reversa (`/api/v1/claro/indoor`)
+- **Não** confundir com anexos URL-only (`attachments[]`) nem com `DACe_url` da Fulfillment
+
+## Regras
+
+1. Uma página A4 por volume **ativo** (`status != CANCELLED`). Cancelado nunca entra. Filtro na query (`list_by_request(exclude_cancelled=True)`) **e** de novo na montagem das páginas (`_active_packages`). `GET /{id}` / `GET /{id}/packages` continuam devolvendo o cancelado (auditoria).
+2. Query opcional `package_id`: só aquele volume, se ativo. Cancelado → **409**. Outro chamado → **404**. Nesta busca a query **não** exclui cancelados, para distinguir 409 de 404.
+3. PDF **gerado na hora**. Sem upload Firebase/GCS e sem persistir arquivo.
+4. `url` do JSON aponta para `.../labels/file` (com `ROOT_PATH` + `API_V1_STR`).
+5. VOL = `Vol {indice_ativos:02d}/{total_ativos:02d}`. Índice 1..N **só dos não cancelados**, mesmo se o `package_number` do pack ainda tiver buraco (ex. ativos 2 e 3 → `01/02` e `02/02`). `package_id` usa a posição daquele pack entre os ativos, não `1/1`. QTD = soma `prepared[].quantity`; se 0, `extra.planned_kits`; senão `0`.
+6. Remetente = GAI `from_location`; destinatário = GAI `to_location`. Campo vazio → `-` (não 400 por endereço incompleto).
+7. Cada página traz Code 128 da **OS interna** e da **OS externa** na **mesma linha** (metade/metade, títulos separados). DACE/NF **só entra se houver valor**, em faixa própria abaixo. Sem DACE/NF, **não** desenha a terceira faixa. Remetente e destinatário em uma linha por extenso (fonte do texto maior que o título). OS interna/externa vazia → `-` sem barras.
+8. Logo em `settings.LABEL_LOGO_PATH` ou `static/labels/logo.png`. Sem arquivo: omite a imagem, não falha.
+9. Sem history. Sem nova tabela.
+10. Inbound → **409** (mesmo isolamento Indoor). Sem volume ativo → **409**. Chamado inexistente → **404**.
+11. DCE ainda em evolução: **não** bloquear emissão se a DCE não estiver ok.
+
+## Fora desta fatia
+
+- Upload do PDF para storage
+- Campo de NF no model (só hook em `extra.nf_number` / `fiscal_number`)
+- 1 DCE por volume físico (rule `272`)
+- wkhtmltopdf / pdfkit
+
+## Testes
+
+- `tests/services/test_stock_request_label.py`
+- `tests/api/api_v1/endpoints/test_stock_request_labels_endpoint.py`
+
+## Fonte
+
+- Spec front: `docs/stock-requests-etiquetas-front.md`
+- Tamanho A4: `docs/ESPEC_TAMANHO_ETIQUETA.md`

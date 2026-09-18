@@ -27,14 +27,14 @@ Exemplo:
 ```python
 from fastapi import APIRouter
 
-from api.api_v1.endpoints import cars
+from api.api_v1.endpoints import lastmile_dashboard
 
 api_router = APIRouter()
 
 api_router.include_router(
-    cars.router,
-    prefix="/cars",
-    tags=["Cars"],
+    lastmile_dashboard.router,
+    prefix="/lastmile",
+    tags=["lastmile-dashboard"],
 )
 ```
 

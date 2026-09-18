@@ -1,0 +1,96 @@
+---
+description: Padrão para testes automatizados por camada usando pytest.
+globs: "tests/**/*.py"
+alwaysApply: false
+---
+
+# Testes
+
+A pasta `tests/` deve seguir a estrutura do projeto.
+
+## Estrutura recomendada
+
+```text
+tests/
+├── conftest.py
+├── services/
+│   └── test_item_service.py
+└── api/
+    └── api_v1/
+        └── endpoints/
+            └── test_items_endpoint.py
+```
+
+## Testes de service
+
+- Testar regra de negócio.
+- Mockar CRUD com `AsyncMock` quando não for teste de integração.
+- Testar erros esperados, como 404, 400 e 409.
+- Testar normalizações e validações.
+
+## Testes de endpoint
+
+- Testar status code.
+- Testar payload de resposta.
+- Mockar service quando o foco for apenas a rota.
+- Usar `httpx.AsyncClient` quando o app for assíncrono.
+- Quando precisar de sessão fake (sem mockar service): `app.dependency_overrides[get_db]`.
+
+## Padrão recomendado — endpoint com service mockado
+
+```python
+@pytest.mark.asyncio
+async def test_create_item_deve_retornar_201(async_client):
+    response = await async_client.post("/api/v1/items/", json={"name": "Teste"})
+    assert response.status_code == 201
+```
+
+## Override de `get_db` (sessão fake)
+
+```python
+from collections.abc import AsyncGenerator
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from db.session import get_db
+from main import app
+
+
+async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+    db = AsyncMock(spec=AsyncSession)
+    yield db
+
+
+@pytest.fixture
+def client_with_db_override():
+    app.dependency_overrides[get_db] = override_get_db
+    yield
+    app.dependency_overrides.clear()
+```
+
+## Regras
+
+- Não depender de API externa real em teste unitário.
+- Não depender de banco real em teste unitário, exceto testes de integração claramente separados.
+- Não usar secrets reais em teste.
+- Criar fixtures reutilizáveis em `conftest.py`.
+- Nomear testes em português ou inglês de forma clara e consistente.
+
+## Testes de integração
+
+- Marcar com `@pytest.mark.integration` e registrar o marker em `pytest.ini`.
+- Colocar em `tests/integration/` quando possível.
+- Exigem `.env` com credenciais de homologação — **não rodam no CI**.
+- Rodar localmente: `python -m pytest tests/integration/ -m integration -v`.
+
+## CI (GitHub Actions)
+
+Pipeline, encoding UTF-8 de `requirements.txt` e config de CI: ver **`075-github-actions-ci-auto.mdc`**.
+
+Resumo:
+
+- CI executa apenas `pytest -m "not integration"`.
+- `requirements.txt` deve estar em **UTF-8** (UTF-16 quebra `pip` no Linux).
+- Copiar `core/example-config.py` → `core/config.py` no job antes dos testes.

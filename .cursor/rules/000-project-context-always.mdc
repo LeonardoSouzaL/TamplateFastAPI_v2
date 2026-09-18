@@ -1,0 +1,58 @@
+---
+description: Contexto global do projeto FastAPI e padrão principal de arquitetura.
+globs: "**/*"
+alwaysApply: true
+---
+
+# Contexto global do projeto
+
+Este projeto segue um template FastAPI com separação clara de responsabilidades.
+
+## Stack principal
+
+- Python
+- FastAPI
+- SQLAlchemy, preferencialmente com `AsyncSession`
+- Pydantic para schemas de entrada e saída
+- HTTPX para consumo de APIs externas
+- Pytest para testes automatizados
+- Estrutura modular por camadas
+
+## Fluxo arquitetural principal
+
+Para operações de banco:
+
+```text
+Endpoint -> Service -> CRUD -> Banco
+```
+
+Para integrações externas:
+
+```text
+Endpoint -> Service -> Core Client -> API externa
+```
+
+## Responsabilidade de cada camada
+
+- `api/`: rotas HTTP, dependências, status code, response_model e chamadas para services.
+- `services/`: regras de negócio, validações, normalizações, orquestrações e transições de status.
+- `crud/`: acesso ao banco, queries, filtros, paginação e operações CRUD.
+- `models/`: modelos SQLAlchemy, tabelas, colunas e relacionamentos.
+- `schemas/`: schemas Pydantic de entrada, atualização, resposta e payloads.
+- `core/`: configurações, segurança, clients externos, autenticação e recursos compartilhados.
+- `db/`: conexão, sessão e base declarativa do banco.
+- `tests/`: testes automatizados por camada.
+- `examples/`: exemplos de uso, sem regra de produção obrigatória.
+
+Dependências entre camadas, criação de módulos e critérios para services: rule `010-architecture-always.mdc`.
+
+## Regras globais
+
+- Não colocar regra de negócio pesada em endpoints.
+- Não acessar banco diretamente em endpoints quando existir service.
+- Não colocar regra de negócio dentro do CRUD.
+- Não misturar schema Pydantic com model SQLAlchemy.
+- Não versionar secrets, tokens, senhas, certificados ou `.env` real.
+- Preferir código assíncrono quando a estrutura do projeto já usa `AsyncSession`.
+- Ao alterar um arquivo existente, entregar o arquivo completo corrigido quando solicitado.
+- Explicar exatamente o que foi criado, alterado ou removido.

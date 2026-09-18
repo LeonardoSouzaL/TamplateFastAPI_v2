@@ -1,0 +1,35 @@
+---
+description: Gate Rule vs Skill — questionar o usuário antes de criar rule operacional grande.
+globs: "**/*"
+alwaysApply: true
+---
+
+# Rule vs Skill — gate de criação
+
+Quando o usuário pedir **criar uma nova rule** (`.cursor/rules/*.mdc`), avalie antes se o conteúdo deve ser **Rule**, **Skill** ou **docs**.
+
+## Critérios
+
+| Situação | Destino |
+|----------|---------|
+| Passo a passo reutilizável | **Skill** |
+| Rotina com etapas ou checklist | **Skill** |
+| Muito grande para rule (~150+ linhas) | **Skill** |
+| Só precisa quando solicitado | **Skill** |
+| Orientação pontual ou referência longa | **docs** |
+| Princípio global curto e obrigatório | **Rule** `alwaysApply: true` |
+| Padrão por camada (globs) | **Rule** com globs |
+| Regra de negócio confirmada | **Rule** `2xx-business-*` |
+
+## Se parecer Skill
+
+**Não crie o `.mdc` imediatamente.** Pergunte ao usuário:
+
+1. O conteúdo é workflow operacional — prefere **Skill** em `.cursor/skills/`?
+2. Se sim: nome sugerido, rule stub curta (se aplicável) e docs de referência.
+3. Se não: confirme que deve ser rule mesmo e justifique brevemente.
+
+## Referências
+
+- Skill de auditoria: `.cursor/skills/auditar-rules-skills-docs/SKILL.md`
+- Índice de rules: `docs/cursor/rules-index.md`

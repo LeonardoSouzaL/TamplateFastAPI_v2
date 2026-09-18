@@ -1,0 +1,26 @@
+# Presets do Mural — fonte única da skill fastapi-process-mapper.
+# Não depende de .env. O agente pergunta apenas: homolog ou prod?
+
+default_environment: homolog
+
+environments:
+  homolog:
+    label: Homologação
+    api_base_url: https://192.168.0.214/hg-api-mural/api/v1/items
+    target_group_id: 34
+    created_by_id: 122
+    requires_token: false
+
+  prod:
+    label: Produção
+    api_base_url: http://192.168.0.215/api-mural/api/v1/items
+    target_group_id: 323
+    created_by_id: 1037
+    requires_token: false
+
+# Resolução na skill:
+# 1. Ler este arquivo.
+# 2. Se o usuário não informou ambiente, perguntar: "homolog ou prod?"
+# 3. Usar o preset correspondente — sem exigir variáveis de ambiente.
+# 4. Em prod, pedir confirmação explícita antes do primeiro upsert.
+# 5. Override manual só se o usuário pedir valores diferentes do preset.

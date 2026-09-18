@@ -8,8 +8,17 @@ Cada model representa uma tabela do banco de dados.
 ```text
 models/
 ├── __init__.py
-└── car_model.py
+├── car_model.py
+├── auth_app_model.py
+├── order_travels_model.py
+├── service_order_model.py
+├── order_types_model.py
+├── status_equipament_model.py
+├── transport_quotes_model.py
+└── logistica_groupaditionalinformation_model.py
 ```
+
+Os models LastMile são **slim e somente leitura**: só colunas usadas nos KPIs, sem `lazy="joined"` e sem hybrid `atrasado`. Não alterar tabelas no banco.
 
 ## Responsabilidade
 

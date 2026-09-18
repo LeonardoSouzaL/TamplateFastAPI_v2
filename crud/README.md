@@ -10,8 +10,18 @@ crud/
 ├── __init__.py
 ├── baseAsync.py
 ├── baseSync.py
-└── crud_cars.py
+├── crud_cars.py
+├── crud_lastmile_metrics.py
+├── crud_lastmile_os_metrics.py
+├── crud_lastmile_os_pa_metrics.py
+├── crud_lastmile_os_client_metrics.py
+├── crud_lastmile_os_driver_metrics.py
+├── crud_lastmile_os_overview_metrics.py
+├── lastmile_os_sla.py
+└── crud_lastmile_driver_metrics.py
 ```
+
+`crud_lastmile_metrics.py` só agrega (`GROUP BY`, `COUNT FILTER`, lookup GAI). Sem `create`/`update`/`remove`. `crud_lastmile_driver_metrics.py` agrega viagens do dia por técnico/status e SLA. `lastmile_os_sla.py` concentra viagem atual e expressões de SLA reutilizadas por `by-pa`, `by-client`, `by-driver` e `overview`.
 
 ## Responsabilidade
 

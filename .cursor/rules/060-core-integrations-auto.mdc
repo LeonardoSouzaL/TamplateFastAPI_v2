@@ -1,0 +1,70 @@
+---
+description: Padrão para clients externos, OAuth2, API Key, certificados e integrações no core.
+globs: "core/**/*.py,services/**/*external*.py,services/**/*client*.py,examples/oauth2_clients/**/*.py"
+alwaysApply: false
+---
+
+# Core e integrações externas
+
+A pasta `core/` deve conter recursos compartilhados e reutilizáveis, incluindo clients de APIs externas.
+
+## Clients externos
+
+Preferir um client centralizado para consumo de APIs, em vez de repetir `httpx` em endpoints/services.
+
+O client deve suportar, quando aplicável:
+
+- sem autenticação;
+- API key via header;
+- API key via query param;
+- bearer token fixo;
+- Basic Auth;
+- OAuth2 Client Credentials;
+- OAuth2 Password Grant quando necessário;
+- client secret via Basic Auth;
+- client secret no body;
+- certificados/mTLS;
+- CA bundle customizado;
+- headers extras;
+- timeout;
+- tratamento padronizado de erro.
+
+## Fluxo recomendado
+
+```text
+Endpoint -> Service -> Core Client -> API externa
+```
+
+## Regras de segurança
+
+- Nunca hardcodar token real.
+- Nunca hardcodar client secret real.
+- Nunca versionar certificado real ou chave privada.
+- Usar `settings` ou variáveis de ambiente.
+- Exemplos devem usar valores fictícios.
+
+## Tratamento de erro
+
+Clients externos devem retornar erros úteis, com:
+
+- status code;
+- endpoint chamado;
+- payload enviado quando seguro;
+- resposta recebida quando seguro;
+- mensagem clara.
+
+Não expor secrets em logs ou exceptions.
+
+## Exemplo de uso
+
+```python
+client = OAuth2APIClient(
+    base_url=settings.EXTERNAL_API_BASE_URL,
+    auth_config=APIAuthConfig(
+        auth_type=AuthType.OAUTH2_CLIENT_CREDENTIALS,
+        token_url=settings.EXTERNAL_TOKEN_URL,
+        client_id=settings.EXTERNAL_CLIENT_ID,
+        client_secret=settings.EXTERNAL_CLIENT_SECRET,
+    ),
+)
+```

@@ -1,4 +1,53 @@
+# Metrics API
+
+API FastAPI **somente leitura** que concentra métricas do sistema Arancia para os dashboards.
+
+A primeira onda cobre o fluxo **LastMile** (mesmo contrato JSON da API de Transportes v2), calculando KPIs no PostgreSQL com `GROUP BY`/`COUNT FILTER` em vez de carregar viagens em memória.
+
+```text
+Endpoint -> Service -> CRUD (SQL agregado, read-only) -> PostgreSQL Transportes
+```
+
+Copie `core/example-config.py` para `core/config.py` e preencha host/usuário/senha fictícios locais. Não versionar secrets.
+
+### Endpoints LastMile
+
+- `GET /api/v1/lastmile/dashboard/pa-summary`
+- `GET /api/v1/lastmile/dashboard/metrics?metric=pending|without_driver|finished|worst_late_pa`
+- `GET /api/v1/lastmile/dashboard/driver-status-summary` — totais de **viagens** LastMile do dia por técnico/status e SLA (`created_at`, `designation_id`, `driver_id`, `carrier_id`, `cliente_id`)
+- `GET /api/v1/lastmile/orders/by-status` — totais de **OS** da visão LastMile, com filtro opcional `status` (CSV), `finished` e `data_inicial`/`data_final` (`service_order.created_at`)
+- `GET /api/v1/lastmile/orders/by-pa` — totais de **OS** LastMile agrupados por PA (`designacao`), com SLA, `pa_ofensora`/`ofensoras` e `melhor_pa`/`melhores`
+- `GET /api/v1/lastmile/orders/by-client` — totais de **OS** LastMile agrupados por cliente (`cliente`), com SLA, `cliente_ofensor`/`ofensores` e `melhor_cliente`/`melhores`
+- `GET /api/v1/lastmile/orders/by-driver` — totais de **OS** LastMile agrupados por técnico (`tecnico` / `auth_app.uid`), com SLA, ociosidade (`last_opening` + rota do dia) e rankings `tecnico_ofensor`/`melhor_tecnico`/`tecnico_ocioso`
+- `GET /api/v1/lastmile/orders/overview` — visão geral de **OS** LastMile (pendente, atendida, prazo, sem técnico, percentuais e efetividade), com filtros de PA e cliente
+
+Dashboards de viagem: sem `order_type`, filtra `LASTMILE,LASTMILE_COLLECT,LASTMILE_DELIVERY`. Datas em `coalesce(route_date, created_at)` são opcionais.
+
+Totais de OS: sem `order_type`, usa `LASTMILE_OS_TYPE_PATTERNS` (`COLLECT`, `NORMAL`, `DESINSTAL%`, `RETIRADA%`). `status=PENDING` conta só `UPPER(type)='PENDING'`. Datas opcionais em `service_order.created_at`. Visão por PA usa a mesma visão de tipos e a PA da OS (`service_order.designation_id`). Visão por cliente usa a mesma visão de tipos e o cliente da OS (`service_order.client_id`). Visão por técnico usa a mesma visão de tipos e o `driver_id` da viagem atual (`auth_app.uid`); ociosidade exige rota hoje (`route_date`) e só conta após 50 minutos sem `last_opening`. Visão geral usa a mesma visão de tipos, PA da OS e cliente da OS, com totais planos (sem ranking).
+
+## Alterações recentes
+
+| Data | Tipo | Módulo/Pasta | Alteração | Impacto |
+| ---- | ---- | ------------ | --------- | ------- |
+| 2026-09-18 | Adicionado | `api/`, `services/`, `crud/`, `schemas/` | Endpoint novo `GET /lastmile/orders/overview` (visão geral de OS LastMile). | Cards de pendente/atendida/prazo/sem técnico, percentuais e efetividade, com filtro de PA e cliente, sem alterar os demais `/orders`. |
+| 2026-09-18 | Alterado | `core/`, `services/`, `tests/` | Carência de ociosidade do técnico em `GET /lastmile/orders/by-driver` passou de 5 para 50 min. | 53 min parado → 180 s ocioso; até 50 min continua 0. |
+| 2026-09-18 | Adicionado | `api/`, `services/`, `crud/`, `schemas/`, `models/` | Endpoint novo `GET /lastmile/orders/by-driver` (totais de OS LastMile por técnico/`auth_app`). | Visão LastMile da OS agrupada por técnico, com SLA, ociosidade e rankings, sem alterar `by-status` / `by-pa` / `by-client`. |
+| 2026-09-18 | Adicionado | `api/`, `services/`, `crud/`, `schemas/` | Endpoint novo `GET /lastmile/orders/by-client` (totais de OS LastMile por cliente/GAI). | Visão LastMile da OS agrupada por cliente, com SLA e rankings, sem alterar `by-status` / `by-pa`. |
+| 2026-09-17 | Adicionado | `api/`, `services/`, `crud/`, `schemas/`, `models/` | Endpoint `GET /lastmile/dashboard/driver-status-summary` (viagens LastMile do dia por técnico/status e SLA). | Totais por técnico sem hidratar viagem nem teto de 5000 da Transportes v1. |
+| 2026-09-17 | Alterado | `schemas/`, `services/` | Rankings `pa_ofensora`, `ofensoras`, `melhor_pa` e `melhores` em `GET /lastmile/orders/by-pa`. | Cards de ofensoras/melhores no mesmo GET, sem consulta extra nem alteração de banco. |
+| 2026-09-17 | Alterado | `schemas/`, `crud/`, `services/` | Removido `com_viagem_count` de `GET /lastmile/orders/by-pa`. | Status da viagem continua em `by_status_viagem`; sem alteração de banco. |
+| 2026-09-17 | Adicionado | `api/`, `services/`, `crud/`, `schemas/`, `models/` | Endpoint `GET /lastmile/orders/by-pa` (totais de OS LastMile por PA/`designacao`). | Visão LastMile da OS agrupada por PA, com viagem atual, sem técnico e SLA de prazo. |
+| 2026-09-17 | Alterado | `api/`, `services/`, `crud/`, `schemas/`, `models/` | Filtro `data_inicial`/`data_final` em `GET /lastmile/orders/by-status` sobre `service_order.created_at`. | Recorte de OS LastMile por período de criação, inclusive no `universe_total`. |
+| 2026-09-17 | Adicionado | `api/`, `services/`, `crud/`, `schemas/`, `models/` | Endpoint `GET /lastmile/orders/by-status` (totais de OS LastMile por status/`finished`). | Visão LastMile da OS com PENDING puro e filtro de finalizador, separado dos KPIs de viagem. |
+| 2026-09-16 | Adicionado | `api/`, `services/`, `crud/`, `models/`, `schemas/` | Dashboard LastMile somente leitura (`pa-summary` e `metrics`) com agregação SQL. | Front consome métricas sem passar pela API de Transportes. |
+| 2026-09-16 | Adicionado | `core/` | Identidade MetricsAPI, OTEL/Loki, sessão PostgreSQL read-only. | Observabilidade e consultas sem escrita no banco. |
+| 2026-09-16 | Removido | `api/api_v1/endpoints/cars.py` | Rotas de exemplo `cars` saíram do router (módulo permanece como exemplo). | API não expõe escrita do template. |
+
+---
+
 # Template FastAPI
+
+Template base para criação de APIs em **FastAPI** seguindo um padrão modular, reutilizável e escalável para projetos com SQLAlchemy, Pydantic, CRUD abstrato, services, consumo de APIs externas, testes automatizados e rotas versionadas.
 
 Template base para criação de APIs em **FastAPI** seguindo um padrão modular, reutilizável e escalável para projetos com SQLAlchemy, Pydantic, CRUD abstrato, services, consumo de APIs externas, testes automatizados e rotas versionadas.
 

@@ -1,0 +1,37 @@
+---
+description: Rule manual para analisar um projeto existente, descobrir regras de negócio e criar rules específicas para novos endpoints.
+globs: "**/*"
+alwaysApply: false
+---
+
+# Rule manual: descoberta de regras de negócio do projeto
+
+**Use a Skill `descobrir-regras-negocio`** em `.cursor/skills/descobrir-regras-negocio/SKILL.md`.
+
+Invoque com `@120-business-rules-discovery-manual` ao mapear projeto legado ou antes de criar endpoints em domínios com regras complexas.
+
+## Objetivo
+
+Analisar o projeto, identificar padrões de negócio e transformá-los em `.cursor/rules/2xx-business-<dominio>-auto.mdc`.
+
+Documentação auxiliar: `.cursor/business-rules/` (não substitui rules ativas).
+
+## Padrão de nome
+
+```text
+.cursor/rules/2xx-business-<dominio>-auto.mdc
+```
+
+Exemplos fictícios (criar no projeto real quando confirmado):
+
+```text
+.cursor/rules/200-business-orders-auto.mdc
+.cursor/rules/210-business-permissions-auto.mdc
+```
+
+## Documentação após criar rule
+
+- Atualizar `docs/cursor/rules-index.md`
+- README do projeto + **Alterações recentes** quando aplicável
+
+Não altere endpoints sem autorização explícita — primeiro análise e composição de rules.

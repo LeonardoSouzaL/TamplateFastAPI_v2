@@ -1,0 +1,63 @@
+---
+description: Padrão para services com regras de negócio, validações e orquestrações.
+globs: "services/**/*.py"
+alwaysApply: false
+---
+
+# Services
+
+A pasta `services/` concentra regras de negócio e orquestrações.
+
+## O service deve fazer
+
+- Validar se registros existem.
+- Validar duplicidade.
+- Normalizar campos antes de salvar.
+- Orquestrar chamadas a um ou mais CRUDs.
+- Orquestrar chamadas a APIs externas via `core/`.
+- Aplicar regras de status.
+- Aplicar regras de cancelamento, finalização, bloqueio ou liberação.
+- Montar payloads de domínio.
+- Lançar `HTTPException` ou exceções próprias quando a regra falhar.
+
+## O service não deve fazer
+
+- Declarar rotas FastAPI.
+- Criar models SQLAlchemy.
+- Definir schemas Pydantic.
+- Fazer query SQL complexa que deveria estar no CRUD.
+- Guardar secrets fixos no código.
+
+## Padrão recomendado
+
+```python
+class ItemService:
+    async def get_item_by_id(self, db: AsyncSession, id: int) -> Item:
+        item = await crud_item.get(db=db, id=id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Item não encontrado.")
+        return item
+
+    async def create_item(self, db: AsyncSession, payload: ItemCreate) -> Item:
+        payload.name = payload.name.strip().upper()
+        return await crud_item.create(db=db, obj_in=payload)
+
+
+item_service = ItemService()
+```
+
+## Regras de normalização
+
+- Campos como códigos, placas, seriais, siglas e documentos podem ser normalizados no service.
+- Não normalizar dentro do endpoint quando a regra pertence ao domínio.
+- Evitar mutar payload quando isso causar efeitos colaterais indesejados; quando necessário, criar cópia/dict.
+
+## Integrações externas
+
+Quando o service precisar chamar API externa:
+
+```text
+Service -> core OAuth2/API client -> API externa
+```
+
+Nunca instanciar `httpx.AsyncClient` repetidamente em vários endpoints se já existir client centralizado.

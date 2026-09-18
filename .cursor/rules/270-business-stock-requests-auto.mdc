@@ -1,0 +1,124 @@
+---
+description: Regras de negócio dos Chamados Indoor (stock requests — preparação de materiais).
+globs: "{services/stock_request_service.py,services/stock_request_email.py,services/stock_request_label.py,api/api_v1/endpoints/stock_requests.py,schemas/stock_request_schema.py,models/stock_request_model.py,models/stock_request_catalog_model.py,crud/crud_stock_request.py,core/crm_email.py}"
+alwaysApply: false
+---
+
+# Rule: Chamados Indoor (stock requests)
+
+## Escopo
+
+- Endpoints `/api/v1/stock-requests*`
+- Service `StockRequestService`
+- Tabelas `logistic_stock_request*`
+- **Não** confundir com Claro Indoor reversa (`/api/v1/claro/indoor`, rule `250`)
+
+## Isolamento
+
+| Fluxo | Prefixo | Papel |
+| ----- | ------- | ----- |
+| Claro Indoor (reversa) | `/v1/claro/indoor` | Devolução de equipamentos |
+| Chamados Indoor | `/v1/stock-requests` (create/prepare/collect) | Preparação de materiais para atendimento |
+| Recebimento de carga | `/v1/stock-requests/inbound-alerts` + `/{id}/receive` | Pré-alerta Transportes + ENTRY de supply (rule `271`) |
+
+`POST /` Indoor **rejeita** `created_by=TRANSPORTES` (400 aponta para `/inbound-alerts`). Listagem `GET /` **exclui** avisos inbound por padrão; PA/CD usa `inbound=true` + `to_location_id`. Prepare/collect/transition em aviso inbound → **409**.
+
+## Regras obrigatórias
+
+1. Protocolo interno `SR########` gerado na criação; `external_protocol` opcional.
+2. Todo create/transition/update/package/prepare/collect grava `logistic_stock_request_history` (event_type, user, timestamp, location, from/to status quando aplicável).
+3. Create: se `request_type.approval_required=true` → status inicial `AWAITING_APPROVAL`; senão → `OPEN`.
+4. Separação (`prepare` / criar package) só em status `OPEN` ou `IN_SEPARATION` (bloqueia `AWAITING_*`).
+5. Primeiro `prepare` em `OPEN` promove automaticamente para `IN_SEPARATION`.
+6. Package com status `SEALED`, `READY` ou `COLLECTED` **não** aceita novos prepares.
+7. Prepare **exige** `package_id` válido do mesmo chamado. `GET /{id}/packages` e `GET /{id}/packages/{package_id}` listam volumes com `prepared[]` aninhado (leitura; sem history).
+8. **Visões de leitura (sem misturar payload):**
+    - `GET /` — listagem (kanban/hub), inclui `request_type` aninhado (aditivo). `from_location_id`/`to_location_id` com **0** = gerencial (todas as localidades; mesmo contrato dos romaneios). PA/CD mandam o GAI real.
+    - `GET /{id}/summary` — resumo administrativo (cabeçalho, tipo, SLA, `collection`; **sem** items/packages/prepared/holds/history/attachments).
+    - `GET /{id}` — detalhe operacional (items, packages, prepared, holds, attachments). **Não** inclui timeline.
+    - `GET /{id}/history` — timeline auditável (única fonte de eventos).
+    - `GET /{id}/transport` — diagnóstico da integração Transportes (abertura + último tracking + último status da viagem; **não** chama a API deles).
+    - `POST /{id}/dce` — retry da DCE (qty solicitada; só se `request_type.dace=true`). Emissão automática no OPEN. Snapshot em `extra.dce` no `GET /{id}`.
+    - `GET /{id}/labels` — JSON `{url, filename, protocol_number, volumes}` para o Django. `GET /{id}/labels/file` devolve o PDF A4 (1 página por volume ativo). Rule `273`.
+9. Prepare: produto preparado pode diferir do solicitado se for o **mesmo tipo** — supply (`extra_info.supplies=true`) ou serializado. O campo `product.category` **não** entra na regra. Supply pode informar `product_id` substituto; serializado vem do serial bipado (**não** exige `stock_item_id` / id interno — inviável para o operador). `request_item_id` é opcional no serializado (API casa o serial com a linha). Em ambos os casos o produto precisa ser do **mesmo `client_id` do chamado**.
+10. Transição para `READY_FOR_PICKUP` exige cobertura por tipo **supply** e **serializado** (soma `requested` vs `prepared` de todas as linhas de cada tipo) **ou** `allow_partial=true` com ao menos um item preparado. Se `request_type.dace=true`, depois da cobertura consulta a Fulfillment `GET /api/v2/dce/status` (`order_number`=`protocol_number`, `volume_number=1`). DCE não emitida / 404 / timeout → **424** (chamado permanece `IN_SEPARATION`; `extra.dce_status` + history `DCE_STATUS_FAILED`). Sem tracking e sem e-mail. `dace=false` → pula a consulta. Rule `272`.
+11. Coleta: somente via `POST /{id}/collect` a partir de `READY_FOR_PICKUP`. `POST /transition` com `to_status_code=COLLECTED` → **409** (mensagem aponta para `/collect`). Collect **não** alinha a viagem no Transportes. Rule `215`.
+12. SLA: `sla_due_at` obrigatório na criação; responses marcam `overdue` se `now > sla_due_at` e status não `finished`. Reject/collect termina com `sla_finished_at`.
+13. **Reserva hard assimétrica:**
+    - **Supply:** ao entrar em `OPEN` (create sem approval ou `approve`), sobe `logistic_stock_supplies.reserved_quantity` + hold em `logistic_stock_request_holds` até o saldo disponível. Disponível = `quantity - reserved_quantity`. Create grava `items.reserved_quantity=0`; cobertura incompleta só em `extra.availability_soft` (não reutiliza o campo da linha). Gap (`requested - hold aberto`) é completado depois: ENTRY / destino de TRANSFER e o `prepare` chamam `fulfill_pending_supply_holds`. Ordem: `priority.sort_order` DESC (URGENT primeiro; sem prioridade por último), empate `sla_due_at` ASC, depois `request.id` ASC. Inbound e status fora de `OPEN`/`IN_SEPARATION` não entram. `items.reserved_quantity` é sincronizado com o hold, não com o snapshot soft.
+    - **Serial:** hold só na bipagem (`prepare`): `IN_DEPOT` → `RESERVED`. Sem alocação FIFO no OPEN.
+    - **Release** em `CANCELLED` / `REJECTED`: seriais `RESERVED` → `IN_DEPOT`; holds supply liberados (sem EXIT).
+    - **Coleta (`COLLECTED`):** seriais `RESERVED` → `IN_TRANSIT` (+ movimento audit `STOCK_REQUEST_COLLECT`); supply EXIT (`quantity`↓) + libera holds/`reserved_quantity`.
+    - **Indicadores:** sem módulo KPI dedicado; disponibilidade/listagens/timeline passam a refletir a saída automaticamente (`quantity`, `reserved_quantity`, status item, history `STOCK_EXIT`/`COLLECTED`).
+14. Commit único no service ao final da operação (rules 015/045).
+15. Prepare respeita teto por linha; prepare supply tenta completar hold faltante (`fulfill`, gap pelo hold aberto) e depois consome o hold OPEN (não re-reserva além do gap). Sem hold após fulfill: 409 por saldo indisponível na origem ou saldo livre já comprometido (sem jargão de hold).
+16. Gate de aprovação (actions em `POST /{id}/transition`): `approve` → `OPEN`; `request_complement` → `AWAITING_COMPLEMENT` (`description` obrigatória); `reject` → `REJECTED` (`description` obrigatória); `resubmit` → `AWAITING_APPROVAL`.
+17. `PATCH /{id}` (edição de texto/itens) **somente** em `AWAITING_COMPLEMENT`.
+18. Rejeição formal **somente** a partir de `AWAITING_APPROVAL` (não a partir de `OPEN`).
+19. Coleta exige `collector_name`, `receipt_url` e `signature_url`; evidências em `request.extra.collection` + history `COLLECTED`/`STOCK_EXIT`. Sem etapa de conferência/embalagem nesta fatia. Baixa física **somente** na coleta (não no prepare).
+20. **Notificação por e-mail:** a stock-api dispara HTML via api-crm (`POST .../emails/broadcast-by-group`, `group_id` em `CRM_EMAIL_GROUP_ID`) nos mesmos dois eventos, **com ou sem** gate de aprovação: **abertura** (`APPROVED` — no `approve` **ou** no `POST /` se `approval_required=false`) e **READY_FOR_PICKUP**. `should_notify=false` e `channel=crm_broadcast_by_group` para o Django **não** duplicar. Falha do CRM **não** bloqueia (snapshot em `extra.email`). Em `POST /{id}/transition` e no create sem aprovação a response inclui `notification` (e snapshot em `history.extra.notification`). Complemento/rejeição: `should_notify=true` (Django envia). Solicitante: `role=requester`, `user_ref=created_by`, `email=null`. Em `READY_FOR_PICKUP` também `pickup_responsible` (`STOCK_REQUEST_PICKUP_NOTIFY_EMAIL`). Sem hint em `resubmit` / `CANCELLED` / `collect` / create **com** aprovação / prepare. Cards do HTML Indoor: ITENS/VOLUMES → OS INTERNA (`protocol_number`) → OS EXTERNA (`external_protocol` ou `—`) → STATUS; Tipo fixo **Chamados Indoor** (catálogo no banco inalterado). HTML da linha: tipo (`BOBINAS` no supply; `product.category` ou `SERIALIZADO`) · SKU · qty.
+21. **Cancel pack / unprepare (sem cancelar o chamado):**
+    - `POST /{id}/packages/{package_id}/cancel` — package `OPEN` → `CANCELLED`; libera todos prepared do volume; chamado permanece `OPEN`/`IN_SEPARATION`. **Recompacta** `package_number`/`label` dos volumes ativos em 1..N (sem buraco). Cancelados **permanecem na lista** com o número/label originais (`status=CANCELLED`, badge de auditoria; unique parcial só nos ativos). Próximo `POST /packages` usa `MAX` só dos não cancelados.
+    - `POST /{id}/prepared/{prepared_id}/unprepare` — remove um prepared; pack segue `OPEN`; chamado intacto.
+    - Serializado: `RESERVED` → `IN_DEPOT`. Supply: reduz `supplies.reserved_quantity` + `hold.quantity` (ou `released_at` se zerar) + `prepared_quantity` / `reserved_quantity` da linha.
+    - Só em chamado `OPEN`/`IN_SEPARATION` e package `OPEN` (409 se `SEALED`/`READY`/`COLLECTED`/`CANCELLED` ou `READY_FOR_PICKUP`).
+    - History: `PACKAGE_CANCELLED` / `ITEM_UNPREPARED` (número no evento = o de **antes** do compact).
+22. **Cliente do chamado:** `client_id` obrigatório no `POST /` (GAI `arancia_client`; alias legado `1` → CIELO via `resolve_client_id`). Persistido em `logistic_stock_requests.client_id`; responses devolvem `client` aninhado (listagem, resumo e detalhe). Imutável no PATCH. Linhas solicitadas (create/PATCH) e prepare (serial/supply) exigem `product.client_id` igual ao GAI do chamado → **409** se outro cliente. Chamado legado sem `client_id`: trava não aplica.
+23. **Abertura de viagem no Transportes ao entrar em `OPEN`:** `action=approve` **e** `POST /` com `approval_required=false` chamam Abertura v2 **antes** do commit / reserva supply (rule `215`, `order_type=REDESPACHO_BOBINAS`). Supply e serializado entram no mesmo payload. **1 item por linha** do chamado; paletes `ceil(qty/1600)` vão em `item_control` / `extra.volumes`; `serial_number` e `requested_quantity` = qty **total** da linha; `external_order_number` = `external_protocol` se preenchido, senão `protocol_number` (`SR########`); supply `product_model={sku} - {description}` (sem descrição ou descrição=SKU → `{sku} - BOBINA`; Tipo UNIQUE o Transportes força). Em seguida emite a DCE **se `request_type.dace=true`** (rule `272`). Falha no approve (viagem ou DCE) → **424** e o chamado permanece `AWAITING_APPROVAL`. Falha no create sem aprovação → **424** e o chamado **não persiste**. Contrato: `docs/abertura-v2-stock.md`.
+28. **DCE Fulfillment:** só se `request_type.dace=true` (coluna em `logistic_stock_request_types`; default `false`). Emitida **ao entrar em `OPEN`** (`action=approve` **e** `POST /` sem aprovação), **depois** da Abertura Transportes, com um único volume (`volume_number=1`) e a **soma de `requested_quantity`** por produto. **Não** espera bipagem. Inbound não dispara. DCE já ok em `extra.dce` → skip (idempotente). Falha da Fulfillment no approve → **424** (chamado permanece `AWAITING_APPROVAL`, sem persistir a falha). Falha no create sem aprovação → **424** e o chamado **não persiste**. Sucesso: `extra.dce` no CREATED/APPROVED. `POST /{id}/dce` permanece como **retry** (qty solicitada; 409 se tipo sem DACE / já ok / inbound / sem qty; 424 se a Fulfillment recusar, persiste `DCE_FAILED`). **Pronto para coleta** consulta `GET /api/v2/dce/status` **antes** do tracking **se `dace=true`**; DCE não emitida ou falha HTTP/rede → **424** (`extra.dce_status` + `DCE_STATUS_FAILED`). **Cancelamento** com DCE ok chama `POST /api/v2/dce/cancel` **antes** de mudar o status; falha → **424** (`extra.dce_cancel` + `DCE_CANCEL_FAILED`). Cancel de package e `REJECTED` **não** disparam. Shipper=`from_location`, recipient=`to_location`. CNPJ do GAI com fallback `FULFILLMENT_SHIPPER_CNPJ` / `FULFILLMENT_RECIPIENT_CNPJ`. Distinto de `GET /items/volumn_product_for_dce`. Rule `272`.
+29. **Status da viagem só no READY_FOR_PICKUP:** se `extra.transport` existir, depois do tracking v3 a API alinha **só a viagem** via `POST /api/v2/integration_system/status` (`status_travel` = `TRANSPORT_INDOOR_READY_TRAVEL_STATUS`, default `Pronto para coleta`; `created_by=ESTOQUE`; `description=READY_FOR_PICKUP`; **sem** `status_os`). GET prévio pula POST se type ou rótulo já bater. Falha **não** bloqueia. Collect/cancel/reject **não** chamam este POST. Contrato: `docs/spec-stock-atualizar-viagem.md`. Rule `215`.
+
+## Transições
+
+```text
+create + approval_required=true  → AWAITING_APPROVAL
+create + approval_required=false → OPEN (+ viagem Transportes + DCE se dace=true + e-mail APPROVED + reserve supply)
+
+AWAITING_APPROVAL → OPEN                 (approve + viagem + DCE se dace=true + e-mail APPROVED + reserve supply)
+AWAITING_APPROVAL → AWAITING_COMPLEMENT  (request_complement)
+AWAITING_APPROVAL → REJECTED             (reject; release se houver hold)
+AWAITING_COMPLEMENT → AWAITING_APPROVAL  (resubmit)
+AWAITING_COMPLEMENT → CANCELLED          (release)
+
+OPEN → IN_SEPARATION | CANCELLED         (cancel → release; se dace=true e DCE ok, cancela DCE antes)
+IN_SEPARATION → READY_FOR_PICKUP | CANCELLED  (READY: se dace=true, GET /dce/status; 424 se não emitida; tracking v3 + viagem "pronto para coleta" se houver OS. cancel: se DCE ok, cancela DCE antes)
+READY_FOR_PICKUP → COLLECTED             (somente POST /collect; EXIT + evidências; sem POST Transportes)
+READY_FOR_PICKUP → CANCELLED             (transition; release sem EXIT; se dace=true e DCE ok, cancela DCE antes; sem POST Transportes)
+```
+
+History: `STOCK_RESERVED`, `STOCK_RELEASED`, `STOCK_EXIT`, `APPROVED`, `COMPLEMENT_REQUESTED`, `REJECTED`, `RESUBMITTED`, `ITEM_PREPARED`, `ITEM_UNPREPARED`, `PACKAGE_CANCELLED`, `COLLECTED`, etc.
+
+## Erros esperados
+
+| Situação | HTTP |
+| -------- | ---- |
+| Chamado/tipo/status/package/item não encontrado | 404 |
+| Transição inválida / package selado / cobertura incompleta / serial não IN_DEPOT ou já RESERVED / prepare supply sem saldo livre na origem / prepare em AWAITING_* / PATCH fora de complemento / collect fora de READY_FOR_PICKUP / transition→COLLECTED / cancel-pack ou unprepare em package não OPEN ou chamado fora de OPEN/IN_SEPARATION / produto de outro cliente no create, PATCH ou prepare / `packages/distribute` com volume ativo, status inválido, `kits` ≠ restante supply ou hold/saldo insuficiente / DCE já emitida (`extra.dce.ok`) / DCE sem quantidade solicitada / DCE em aviso inbound / retry DCE com `dace=false` / etiquetas sem volume ativo, volume cancelado ou aviso inbound | 409 |
+| Payload supply vs serial incorreto (supply sem `request_item_id`; serial+quantity juntos); action sem description; action XOR to_status_code; collect sem coletor/comprovante/assinatura; `client_id` inválido / fora de `arancia_client`; `packages/distribute` com kits/volumes ≤ 0 ou volumes > kits; DCE sem CNPJ/endereço/telefone/preço | 400 |
+| `GET /catalogs/types` sem `client_id` | 422 |
+| Falha ao abrir viagem no Transportes no `approve` | 424; status permanece `AWAITING_APPROVAL` |
+| Falha ao abrir viagem no Transportes no create sem aprovação | 424; chamado **não** é persistido |
+| Falha ao emitir DCE no `approve` | 424; status permanece `AWAITING_APPROVAL` |
+| Falha ao emitir DCE no create sem aprovação | 424; chamado **não** é persistido |
+| Falha no retry `POST /{id}/dce` | 424; status inalterado; snapshot em `extra.dce` |
+| Falha ao confirmar DCE no `READY_FOR_PICKUP` | 424; status permanece `IN_SEPARATION`; snapshot em `extra.dce_status` |
+| Falha ao cancelar DCE no `CANCELLED` | 424; status inalterado; snapshot em `extra.dce_cancel` |
+| Falha de tracking no `READY_FOR_PICKUP` | 200 (chamado segue); diagnóstico em `GET /{id}/transport` |
+| Falha ao alinhar viagem no `READY_FOR_PICKUP` | 200 (chamado segue); diagnóstico `TRAVEL_STATUS_FAILED` em `GET /{id}/transport` |
+| Falha do e-mail api-crm no `approve` / create sem aprovação / `READY_FOR_PICKUP` | 200 (chamado segue); snapshot em `extra.email` |
+
+## Testes
+
+- `tests/services/test_stock_request_service.py`
+- `tests/services/test_transport_service_order.py` (payload Indoor + approve + tracking READY + status da viagem)
+- `tests/services/test_stock_request_email.py` + `tests/core/test_crm_email.py` (broadcast-by-group)
+- `tests/services/test_fulfillment_dce.py` (payload DCE + emit no OPEN se dace=true + GET /dce/status no READY + cancel no CANCELLED)
+- `tests/services/test_stock_request_label.py` + `tests/api/api_v1/endpoints/test_stock_request_labels_endpoint.py` (etiquetas A4)
+
+## Fonte
+
+- MVP 2026-08-05; aprovação 2026-08-06; reserva hard 2026-08-06; coleta 2026-08-07; hints notificação 2026-08-10; cancel pack / unprepare 2026-08-12; client_id do chamado 2026-08-13; GET packages 2026-08-13; Abertura v2 Transportes no approve 2026-08-17; visões summary + history independente 2026-08-17; tracking v3 READY_FOR_PICKUP 2026-08-18; paletes 1600 na abertura Indoor 2026-08-18; e-mail api-crm no approve/READY 2026-08-19; top-up de hold na ENTRY 2026-08-20; catálogo de tipos por GAI 2026-08-20; tipo Indoor = GAI CIELO da allowlist 2026-08-21; gap de hold ignora snapshot soft 2026-08-21; listagem gerencial `from_location_id=0` 2026-08-21; create sem aprovação abre viagem + e-mail APPROVED 2026-08-21; anexos URL-only no POST / e GET /{id} 2026-08-24; distribuição uniforme kits/volumes no Indoor 2026-08-24; distribuição auto-prepara supply nos volumes 2026-08-25; cards e-mail Indoor OS INTERNA/EXTERNA 2026-09-01; cancel de volume visível na auditoria 2026-09-02; listagem com `request_type` 2026-09-02; observação da transição no tracking READY 2026-09-03; DCE Fulfillment no OPEN (qty solicitada) 2026-09-09; cancel DCE no CANCELLED 2026-09-09; status DCE no READY_FOR_PICKUP 2026-09-09; etiquetas A4 dos volumes 2026-09-10; DCE opt-in via `request_type.dace` 2026-09-10; status da viagem só no READY_FOR_PICKUP 2026-09-11
+- Doc: `docs/stock-requests-mvp.md`, `docs/abertura-v2-stock.md`, `docs/pre-alerta-recebimento-transportes.md`, `docs/stock-requests-etiquetas-front.md`, `docs/spec-stock-atualizar-viagem.md`
+- Inbound (pré-alerta + receive): rule `271`, `services/inbound_receipt_service.py`
+- Etiquetas A4: rule `273`, `services/stock_request_label.py`
+- Decisão: `.cursor/business-rules/decisions.md`

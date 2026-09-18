@@ -1,0 +1,81 @@
+---
+description: Regras de negócio do recebimento de carga (pré-alerta Transportes + ENTRY supply).
+globs: "{services/inbound_receipt_service.py,services/stock_request_email.py,services/stock_request_service.py,schemas/inbound_receipt_schema.py,schemas/stock_request_schema.py,api/api_v1/endpoints/stock_requests.py,crud/crud_stock_request.py}"
+alwaysApply: false
+---
+
+# Rule: Recebimento de carga (inbound)
+
+## Escopo
+
+- `POST /api/v1/stock-requests/inbound-alerts` — pré-alerta (Transportes)
+- `GET /api/v1/stock-requests/inbound-alerts` — lista só avisos `created_by=TRANSPORTES`
+- `POST /api/v1/stock-requests/{id}/receive` — conferência PA/CD
+- Service `InboundReceiptService`
+- Tipo seed **Recebimento de carga** (`extra.inbound=true`)
+- Status `AWAITING_RECEIPT` / `RECEIVED`
+
+**Não** confundir com Chamado Indoor de saída (rule `270`) nem com romaneio PA→CD `RECEIVE` (rule `210`).
+
+Swagger: tag **Recebimento de carga V1** (separado de **Chamados Indoor V1**).
+
+## Isolamento
+
+| Passo | Quem | Estoque |
+| ----- | ---- | ------- |
+| Pré-alerta | Transportes na **criação** `ABASTECIMENTO_BOBINAS` ou na **coleta** dos demais tipos | **Não** dá ENTRY/IN |
+| Conferência | PA/CD em `GET /{id}` | — |
+| Recebimento | Operador PA/CD informa qty real em `POST /{id}/receive` | **Só supply** (`ENTRY` no `to_location`) |
+
+Contrato Transportes congelado: `docs/pre-alerta-recebimento-transportes.md`. Path e payload **não** mudam.
+
+## Regras obrigatórias
+
+1. `created_by` do pré-alerta = literal `TRANSPORTES` → senão **400**.
+2. Idempotência por `service.external_order_number` (`external_protocol`). Retry devolve o mesmo aviso com `reused=true`. **Não** dá segundo ENTRY.
+3. Origem/destino: GAI existente por `id` ou `nome` (ilike). Stock **não cria** GAI. Sem os dois → **400**; inexistente → **404**.
+4. Cliente: GAI `arancia_client` pela marca (`CIELO`, …). Inexistente → **404**.
+5. `items[]` obrigatório no pré-alerta; cada linha é supply XOR serializado (`is_supply`). Mistura serial + qty supply → **400**.
+6. Supply: produto com `extra_info.supplies=true`; SKU de outro cliente → **409**. Linhas do mesmo SKU são agregadas. Sem hold / `reserved_quantity`.
+7. Serial: persistido no aviso (`extra.serial_number`); **não** cria `logistic_stock_item` nem movimento IN. Duplicado em outro aviso ativo → **409**.
+8. Status inicial `AWAITING_RECEIPT`. History `INBOUND_ALERT_CREATED`.
+9. Receive só em `AWAITING_RECEIPT`. Já `RECEIVED` → **409** (não re-ENTRY).
+10. Receive: ENTRY via `SupplyMovementService` (`commit=False`) no `to_location` do aviso; `order_number` = protocolo `SR########`. Commit do receive no service; snapshot de e-mail pode ter commit seguinte (como Indoor).
+11. Serial no receive: aceito; resposta `skipped_serials[]` com `reason=not_implemented`. Zero movimento serializado.
+12. Aviso só com serial (sem supply) no receive → **409**.
+13. `GET /stock-requests/inbound-alerts` = só pré-alertas `created_by=TRANSPORTES`. PA/CD também pode usar `GET /stock-requests?inbound=true&to_location_id=`. Sem `inbound=true` a listagem Indoor **não** mistura avisos.
+14. Indoor `POST /` com `created_by=TRANSPORTES` → **400** apontando para `/inbound-alerts`.
+15. **Conferência obrigatória:** `items` no receive é obrigatório (SKU + qty do que chegou). SKU do aviso ausente no payload = recebido `0`. Lista vazia = nada chegou (todas `under`, sem ENTRY).
+16. **Comprovante e assinatura:** `receipt_url` e `signature_url` obrigatórios (upload no Django; API guarda URL). Espaço em branco → **400**. Ausente/vazio no schema → **422**. Persistido em `extra.receipt` e `history.extra` de `INBOUND_RECEIVED`. GET `/{id}` e `/summary` expõem `receipt` (Indoor fica `null`).
+17. **Divergência não bloqueia.** Qty a mais, a menos ou SKU extra (não estava no aviso) dá ENTRY do valor real. SKU extra cria linha `StockRequestItem` com `extra.unexpected=true`. SKU inexistente → **404**; outro cliente → **409**.
+18. History `INBOUND_QTY_VARIANCE` com `extra.variances[]` (`sku`, `expected`, `received`, `delta`, `kind`: `over` | `under` | `extra_sku`). Resposta `variances[]`.
+19. **E-mail CRÍTICO:** se houver ao menos um `delta != 0`, disparar api-crm (`broadcast-by-group`, mesmo `CRM_EMAIL_GROUP_ID`) com assunto `[CRÍTICO] Divergência de recebimento ({protocol})`. `should_notify=false`. Falha do CRM **não** desfaz o receive (snapshot em `extra.email` / `history.extra.email`).
+
+## Transições
+
+```text
+POST /inbound-alerts → AWAITING_RECEIPT  (só aviso)
+GET  /{id}           → conferência (itens do aviso)
+POST /{id}/receive   → RECEIVED          (ENTRY supply; divergência não bloqueia)
+```
+
+## Erros esperados
+
+| Situação | HTTP |
+| -------- | ---- |
+| `created_by` ≠ TRANSPORTES; GAI sem id/nome; item misturando serial+qty supply; `receipt_url`/`signature_url` só espaço | 400 |
+| GAI/SKU/`product_id` inexistente; aviso inexistente | 404 |
+| SKU de outro cliente; serial em outro aviso ativo; receive fora de AWAITING_RECEIPT; já RECEIVED; aviso só serial | 409 |
+| Campo obrigatório (`items`, `receipt_url`, `signature_url`) / quantity ≤ 0 | 422 |
+
+## Testes
+
+- `tests/services/test_inbound_receipt_service.py`
+- `tests/services/test_stock_request_email.py` (HTML crítico)
+
+## Fonte
+
+- 2026-08-18; contrato `docs/pre-alerta-recebimento-transportes.md`
+- 2026-08-19; divergência + e-mail CRÍTICO
+- 2026-08-21; conferência obrigatória + comprovante/assinatura no receive
+- Decisão: `.cursor/business-rules/decisions.md`

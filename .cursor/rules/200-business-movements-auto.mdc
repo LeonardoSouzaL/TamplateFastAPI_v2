@@ -1,0 +1,193 @@
+---
+description: Regras de negócio para movimentações de estoque (MovementService e endpoints).
+globs: "{services/movement.py,api/api_v1/endpoints/movement.py,schemas/movement_schema.py,schemas/item_schema.py,schemas/item_query_schema.py,models/movement_model.py,crud/crud_movement.py,crud/crud_item.py,services/item.py,api/api_v1/endpoints/item.py,services/technician_bag.py,schemas/technician_bag_schema.py}"
+alwaysApply: false
+---
+
+# Rule: Movimentações de estoque
+
+## Escopo
+
+- `services/movement.py` — `MovementService`
+- `api/api_v1/endpoints/movement.py`
+- `schemas/movement_schema.py`, `schemas/item_schema.py`
+- `models/movement_model.py`, `crud/crud_movement.py`
+
+## Campos distintos (decisão do time)
+
+- **`movement_type`** (ex.: `RETURN`, `IN`, `TRANSFER`): tipo do registro em `logistic_stock_movement`.
+- **`OrderOrigin.project_name`** (ex.: `REVERSA`): metadado da origem do pedido; usado em filtros e exibição.
+
+Não tratar `movement_type=RETURN` e `project_name=REVERSA` como o mesmo conceito nem "unificar" nomenclatura entre eles.
+
+## Superfícies de integração
+
+| Superfície | Uso |
+| ---------- | --- |
+| **`POST /v1/movements/`** e **`/move-list-items`** | Integradores de **recebimento** (`IN`, `PRE_RECEIVE`, `RECEIVE`), **delivery** (`DELIVERY`) e **APP coleta** (`COLLECTED`). Sem bloqueio HTTP por tipo ou origem REVERSA. |
+| **`POST /v2/romaneios/finish/{n}`** | Fluxo PA→CD agregado via `RomaneioService.advance_romaneio` (rule `210`). Movimentos de item gerados **internamente**. |
+
+## Última movimentação vs ponteiros no item
+
+- **Última movimentação (consulta/filtro):** `MAX(movement.id)` por `item_id` — usada em `GET /items/search-by-movement` e regras de elegibilidade dessa rota. Todos os filtros de movimentação (`created_by`, `movement_type`, período) aplicam-se **somente** a esse registro.
+- **Ponteiros no item:** `last_in_movement_id` e `last_out_movement_id` — último movimento de entrada/saída por tipo; usados em listagens (`list-byid`), enriquecimento de resposta e atualização pós-`create_movement`. **Não** substituem `MAX(id)` na consulta search-by-movement.
+
+Itens sem nenhuma movimentação ficam de fora da search-by-movement. Combinação de filtros: **AND** (qualquer filtro informado que não bater exclui o item).
+
+## Regras obrigatórias
+
+1. Toda criação de movimento passa por `MovementService.create_movement`.
+2. Após criar movimento, atualizar item: `location_id`, `status`, `last_in_movement_id`, `last_out_movement_id`.
+3. Apenas `IN` e `COLLECTED` podem criar item inexistente; demais tipos retornam **424** se o serial não existir.
+4. Validação de status pré-movimento: mapa `MOVEMENT_ITEM_PREREQUISITE_STATUSES` para tipos PA→CD/legado; demais tipos exigem `IN_DEPOT`, salvo header HTTP `ignore_status_rule=true` (**uso excepcional**).
+5. No APP de coleta: `movement_type=COLLECTED` pode usar `product_id=0` quando o produto não estiver disponível.
+6. **`COLLECTED` + cliente Claro + `order_number` prefixo `CLR`**: injetar `extra_info.baixa_toa=false` e `baixa_toa_updated_by=created_by` em `create_movement` (Movement API e bag); integrador **não** pode sobrescrever via `extra_info`.
+7. **Não** chamar `orchestrate_romaneio_status` no endpoint movement — PA→CD concentra-se em `advance_romaneio` (rule `210`).
+8. **Produtos insumo** (`extra_info.supplies=true`): **bloquear** em `create_movement` com **400** — usar Supply Control (`/v1/supplies/movements`). Ver rule `260-business-supply-control-auto.mdc`.
+
+## Fluxos principais
+
+### `create_movement`
+
+1. Buscar item por serial (exceto criação em `IN`/`COLLECTED`).
+2. Validar status pré-movimento (`MOVEMENT_ITEM_PREREQUISITE_STATUSES` ou `IN_DEPOT`).
+3. Rejeitar se produto for insumo (`extra_info.supplies=true`) → **400**.
+4. Fluxo Cielo em `IN` sem item: ver rule `220-business-cielo-sap-auto.mdc` (CHIP exige `product_id`; sem ILG).
+5. Aplicar default `baixa_toa=false` para `COLLECTED` Claro + OS `CLR*` (`apply_claro_clr_collected_baixa_toa_default`).
+6. Criar `MovementCreate` e persistir.
+7. Atualizar item com novo status e ponteiros de último movimento entrada/saída.
+
+### Atualização de romaneio
+
+`update_rom_by_movement(romaneio_in, movement_type)`:
+
+- Parse do número AR* (prefixo `AR1` vs demais — ver rule `210`).
+- Tipos gerais: todos os itens do romaneio devem ter `Item.status` esperado pelo mapa; senão **400**.
+- **RECEIVE**: valida **somente itens `ck=True`**; todos ck → `RECEIVED`, algum ck false → **`PARTIALLY_RECEIVED`**.
+- Se OK, atualizar `status_rom` via mapa (ou lógica parcial para RECEIVE) quando diferente do atual.
+
+## Status e transições (item)
+
+Mapa `MOVEMENT_ITEM_STATUS_MAP` em `services/movement.py`:
+
+| movement_type | Item.status |
+| ------------- | ----------- |
+| IN | IN_DEPOT |
+| DELIVERY | WITH_CUSTOMER |
+| RETURN | WITH_CLIENT |
+| COLLECTION_REQUEST_RECEIVED | READY_FOR_COLLECTING |
+| TRANSFER | IN_TRANSIT |
+| ADJUST | IN_DEPOT |
+| COLLECTED | IN_TRANSIT |
+| RECEIVE | IN_DEPOT |
+| PICKING | PICKED_FOR_DELIVERY |
+| PACKING | READY_FOR_DELIVERY |
+| TO_BE_DELIVERED | IN_TRANSIT |
+| DELIVERED | IN_TRANSIT |
+| PRE_RECEIVE | IN_TRANSIT |
+| BAG_REMOVED | REMOVED_FROM_BAG |
+
+`COLLECTION_REQUEST`: sem movimento de item (via finish).
+
+Mapa romaneio `MOVEMENT_ROMANEIO_STATUS_MAP`:
+
+| movement_type | status_rom |
+| ------------- | ---------- |
+| PACKING | READY |
+| COLLECTION_REQUEST | COLLECTION_REQUESTED |
+| COLLECTION_REQUEST_RECEIVED | AWAITING_COLLECTION |
+| RETURN (legado) | DISPATCHED |
+| TRANSFER (legado) | DISPATCHED |
+| COLLECTED | DISPATCHED |
+| DELIVERED | VALIDATION_PENDING |
+| PRE_RECEIVE | PRE_RECEIVED |
+| RECEIVE | RECEIVED (todos ck) / PARTIALLY_RECEIVED (parcial) |
+
+## Validações
+
+- `move-list-items`: para tipos ≠ `IN`, todos os seriais devem existir antes do loop (**400**).
+- `volume_number` e `kit_number` obrigatórios por item ou no payload geral (**400**).
+- Serial: convenção UPPER onde o fluxo já aplica (romaneio faz em outro service).
+
+## Bag do técnico
+
+Bag **desacoplada de romaneio** — sem `romaneio_id`. Service: `TechnicianBagService` (`services/technician_bag.py`).
+
+### Consulta — `GET /api/v1/items/bag`
+
+- Chave: **`order_number`** (obrigatório) da **última movimentação** (`MAX(movement.id)`).
+- Elegibilidade fixa: último movimento `IN` ou `COLLECTED` com `order_number` informado.
+- Filtros opcionais: `created_by`, `status` (item), `movement_date_from` / `movement_date_to`, paginação.
+- Itens com último movimento `BAG_REMOVED` (status `REMOVED_FROM_BAG`) **não** aparecem.
+- Response: `List[ItemSearchByMovementSchema]` (mesmo schema de `search-by-movement`).
+
+### Mutações
+
+| Rota | Ação | Mecanismo |
+| ---- | ---- | --------- |
+| `POST .../bag/{order_number}/serials` | Adicionar | `MovementService.create_movement` com **`COLLECTED` fixo**, `product_id=0` e `order_number` do path; Claro + OS `CLR*` → `extra_info.baixa_toa=false` (regra central em `MovementService`) |
+| `DELETE .../bag/{order_number}/serials/{serial}` | Remover | Movimento `BAG_REMOVED` → status `REMOVED_FROM_BAG`; body: `created_by` (+ `extra_info` opcional) |
+| `PUT .../bag/{order_number}/serials/{serial}` | Trocar serial | UPDATE direto em `item.serial` (**sem** novo movimento); auditoria em `item.extra_info.bag_serial_replaced` |
+| `PATCH .../bag/{order_number}/baixa-toa` | Baixa TOA (CLR) em lote | UPDATE em `extra_info` do movimento IN/COLLECTED (**sem** novo movimento); resposta `{ updated, errors }` com sucesso parcial (HTTP 200) |
+
+### `BAG_REMOVED`
+
+- Mapa: `MOVEMENT_ITEM_STATUS_MAP[BAG_REMOVED] = REMOVED_FROM_BAG`.
+- Pré-condição (`MOVEMENT_ITEM_PREREQUISITE_STATUSES`): item em `IN_TRANSIT` (COLLECTED) ou `IN_DEPOT` (IN).
+- **Sem** `ignore_status_rule` — pré-condição explícita cobre os casos da bag.
+- `extra_info` do movimento pode registrar `bag_order_number` e motivo opcional.
+
+### Troca de serial
+
+1. Validar serial pertence à bag (`order_number` + último mov `IN`/`COLLECTED`).
+2. Normalizar via `normalize_item_serial` (uppercase).
+3. `new_serial` duplicado em outro item → **409 Conflict**.
+4. `new_serial` igual ao atual → **422**.
+5. Serial fora da bag → **404**.
+
+Histórico de movimentos permanece no mesmo `item_id`; integradores que guardaram serial antigo devem reconsultar a bag.
+
+### Relação com `search-by-movement`
+
+| Aspecto | `search-by-movement` | `GET /items/bag` |
+| ------- | -------------------- | ---------------- |
+| Chave principal | `created_by` (obrig.) | `order_number` (obrig.) |
+| Tipos último mov. | Qualquer (filtro opcional) | Fixo: `IN` ou `COLLECTED` |
+| Mutações | Não | POST / DELETE / PUT |
+
+**Não alterar** o contrato de `search-by-movement`.
+
+## Integrações/eventos
+
+- Consulta síncrona Cielo apenas no fluxo de entrada Cielo — rule `220`.
+- **`COLLECTION_REQUEST`** (finish romaneio): abertura de OS no Transportes via `TransportServiceOrderService` — rule `215`.
+- Não chamar APIs externas diretamente no endpoint; usar service + `core.request.RequestClient`.
+
+## Erros esperados
+
+| Situação | HTTP |
+| -------- | ---- |
+| Item não encontrado (tipo ≠ IN/COLLECTED) | 424 |
+| Status inválido para movimentação | 400 |
+| Item da lista não encontrado (move-list-items) | 400 |
+| Romaneio/item não encontrado em `update_rom_by_movement` | 404 |
+| Item do romaneio com status inesperado | 400 |
+| Falha consulta síncrona Cielo (não CHIP) | 424 (+ provisional_serial no detail) |
+| IN Cielo CHIP sem `product_id` ou falha SAP | 400 |
+| Serial fora da bag (remove/replace) | 404 |
+| Serial duplicado na troca | 409 |
+
+## Testes esperados
+
+- `IN` cria item; `OUT`/`RETURN` em item inexistente → 424.
+- `IN_DEPOT` obrigatório vs `ignore_status_rule`.
+- Mapas `MOVEMENT_ITEM_STATUS_MAP` / `MOVEMENT_ROMANEIO_STATUS_MAP` (RETURN legado → DISPATCHED; DELIVERED → IN_TRANSIT; BAG_REMOVED → REMOVED_FROM_BAG).
+- `COLLECTED` exige item `READY_FOR_COLLECTING` quando validação ativa.
+- `COLLECTED` Claro + OS `CLR*`: `baixa_toa=false` automático (`tests/services/test_movement_service.py`).
+- `fail_romaneio_processing` → romaneio `PROCESSING_ERROR` + log estruturado.
+- Bag: consulta por `order_number` (IN/COLLECTED); add/remove/replace; remove some da listagem; replace sem movimento; duplicado → 409; fora da bag → 404 (`tests/services/test_technician_bag.py`, `tests/api/api_v1/endpoints/test_technician_bag_endpoint.py`).
+
+## Fonte da regra
+
+- Código: `services/movement.py`, `api/api_v1/endpoints/movement.py`, `services/technician_bag.py`, `api/api_v1/endpoints/item.py`
+- Decisões: `.cursor/business-rules/decisions.md` (2026-06-01: movement_type vs project_name; 2026-06-12: bag do técnico)

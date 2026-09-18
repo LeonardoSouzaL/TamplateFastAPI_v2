@@ -1,0 +1,115 @@
+---
+description: Regras de negócio para catálogo — produtos, origens, clientes e locations.
+globs: "{api/api_v1/endpoints/product.py,api/api_v1/endpoints/client.py,api/api_v1/endpoints/origin.py,api/api_v1/endpoints/location.py,services/client_gai.py,services/stock_client_catalog.py,schemas/product_schema.py,schemas/origin_schema.py,schemas/client_schema.py,schemas/stock_client_catalog_schema.py,schemas/location_schema.py,models/product_model.py,models/origin_model.py,models/location_model.py,models/stock_client_catalog_model.py,crud/crud_product.py,crud/crud_origin.py,crud/crud_location.py,crud/crud_stock_client_catalog.py}"
+alwaysApply: false
+---
+
+# Rule: Catálogo (produto, origem, cliente, location)
+
+## Escopo
+
+- `api/api_v1/endpoints/product.py`, `client.py`, `origin.py`, `location.py`
+- `services/client_gai.py` — resolução de cliente contratante (GAI `arancia_client`)
+- Models: `logistic_stock_product`, `logistic_stock_order_origin`, `logistica_groupaditionalinformation`
+- CRUDs `crud_product`, `crud_origin`, `crud_location`
+
+## Cliente contratante vs location operacional
+
+Mesma tabela Django `logistica_groupaditionalinformation` (model `Location`), papéis distintos:
+
+| Papel | Discriminação | FK na API |
+| ----- | ------------- | --------- |
+| Cliente contratante | `auth_group.name = arancia_client` | `client_id` em produto, origem, romaneio |
+| Local operacional | demais groups (`arancia_PA`, depósitos, …) | `location_id` em item, romaneio origem/destino |
+
+- **Cadastro de clientes (GAI)**: somente no Django; a API não cria GAIs.
+- **Visibilidade no estoque**: tabela `logistic_stock_client_catalog` (allowlist owned pelo stock-api). Presença com `enabled=true` = cliente aparece em `GET /v1/clients`. GAIs `arancia_client` fora do catálogo = transporte-only ou ainda não habilitados.
+- **`GET /v1/clients`**: GAIs `arancia_client` **∩** catálogo (`enabled=true`). Query `include_all=true` lista todos `arancia_client` (admin/debug).
+- **Gestão do catálogo**: `GET/POST/PATCH/DELETE /v1/clients/catalog` — POST aceita `gai_id` ou `client_code`; PATCH altera `enabled`; DELETE remove do allowlist (não apaga GAI Django).
+- **Demais fluxos** (`resolve_client_by_code`, `assert_client_gai`, `resolve_client_id`, romaneio, movimentação): **não** filtram pelo catálogo — romaneio/transporte continua funcionando para GAIs fora do allowlist.
+- **`client_code`**: `nome` do GAI em minúsculas (`CIELO` → `cielo`); filtros por path/query case-insensitive via `resolve_client_by_code`.
+- **Alias legado na entrada**: `client_id == 1` em writes (produto, origem, etc.) → remapeado para o GAI `CIELO` antes de persistir (`LEGACY_CIELO_CLIENT_ID`). Na **saída**, retornar o id real do GAI.
+- Tabela `logistic_stock_client` **removida**; migration Alembic remapeia FKs existentes.
+
+Auditoria pré-migração: `scripts/audit_client_to_gai.sql` (confirmar GAI CIELO e anotar `cielo_gai_id` real).
+
+## Regras obrigatórias
+
+1. **Produto duplicado**: mesma combinação `sku` + `description` já cadastrada → **423**; não criar segundo registro.
+2. **Cliente em `POST /products/`**: `resolve_client_id` + `assert_client_gai` → **400** se GAI inválido.
+3. **Cielo (não-CHIP)**: `extra_info.measures` obrigatório (`is_cielo_client(gai)` e `category != 'CHIP'`). Ver rule `220`.
+4. **`OrderOrigin`**: `origin_name`, `project_name`, `stock_type`, `client_id` (GAI).
+5. **Padrão reversa (romaneio v2)**: `origin_name=arancia`, `project_name=REVERSA`, `stock_type=Aguardando Reversa` (+ `client_id` do romaneio = GAI).
+6. **Seriais provisórios ILG**: origem `Aguardando Reversa (Seriais Provisórios)` — rule `220`.
+7. **`EVENTS_INTELIPOST`**: referência em `core/config.py`; não usado pelos fluxos desta API.
+8. **Autenticação**: intencionalmente ausente na FastAPI — ver `080` e `decisions.md`.
+9. **Insumos (Supply Control)**: produto marcado com `extra_info.supplies=true`. **Não** confundir com `OrderOrigin.stock_type = "Suprimento P/ Entrega"` (origem de pedido serializado). Cadastro continua em `POST /products`; saldo/movimentação em `/v1/supplies*` (rule `260`).
+
+## Catálogo de origens (`logistic_stock_order_origin`)
+
+Unique: `(origin_name, project_name, client_id, stock_type)`. Após migration, `client_id` é o **id do GAI Cielo** (não mais `1` do stock legado). Combinações de negócio para Cielo (exemplos — conferir ids no banco pós-migração):
+
+| origin_name | project_name | stock_type |
+|-------------|--------------|------------|
+| arancia | REVERSA | Aguardando Reversa |
+| arancia | REVERSA | Aguardando Reversa (Seriais Provisórios) |
+| intelipost | last_mile_b2c | Suprimento P/ Entrega |
+| intelipost | last_mile_b2c | Aguardando Reversa |
+| intelipost | last_mile_b2c | Aguardando Reversa (Seriais Provisórios) |
+| sap | Caça_POS | Aguardando Reversa |
+| sap | Caça_POS | Aguardando Reversa (Seriais Provisórios) |
+| SAP | BAU | Suprimento P/ Entrega |
+
+Nota: `sap` vs `SAP` — case exato nos filtros.
+
+## Fluxos principais
+
+### Produto
+
+- `GET /` e `GET /{client}`: listagem; filtro por client usa `resolve_client_by_code` + `client_id`.
+- `POST /` e `POST /list`: `resolve_client_id`, measures Cielo, duplicidade → criar ou **423**.
+
+### Origem
+
+- `GET /{client}`: `resolve_client_by_code` + filtro `client_id`.
+- `POST /`: `resolve_client_id` antes do CRUD.
+
+### Cliente
+
+- `GET /`: lista GAIs `arancia_client` **no catálogo de estoque** (`enabled=true`); `include_all=true` para todos.
+- `GET/POST/PATCH/DELETE /catalog`: gestão do allowlist (`logistic_stock_client_catalog`).
+
+| Situação | HTTP |
+| -------- | ---- |
+| GAI não é `arancia_client` (POST catalog) | 400 |
+| Entrada duplicada já enabled | 409 |
+| `catalog_id` inexistente | 404 |
+| POST com `client_code` inválido | 400 |
+
+### Location
+
+- CRUD/consulta de locais operacionais (demais groups); sem misturar com cadastro de cliente contratante.
+
+## Validações
+
+| Campo / regra | Comportamento |
+| ------------- | ------------- |
+| `sku` + `description` duplicados | 423 |
+| `client_id` inválido | 400 |
+| Cielo sem `measures` (≠ CHIP) | 400 |
+| Origem reversa v2 | `arancia` + `REVERSA` + `Aguardando Reversa` + `client_id` GAI do romaneio |
+
+## Erros esperados
+
+| Situação | HTTP |
+| -------- | ---- |
+| Produto duplicado | 423 |
+| Cliente GAI não encontrado | 400 |
+| Entrada catálogo duplicada (enabled) | 409 |
+| Entrada catálogo inexistente | 404 |
+| Measures ausentes (Cielo) | 400 |
+
+## Fonte da regra
+
+- Código: `services/client_gai.py`, `services/stock_client_catalog.py`, `product.py`, `origin.py`, `client.py`
+- Decisões: `.cursor/business-rules/decisions.md` (migração client → GAI, catálogo allowlist, 2026-06-01)

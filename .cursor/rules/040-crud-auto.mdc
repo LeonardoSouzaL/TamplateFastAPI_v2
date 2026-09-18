@@ -1,0 +1,63 @@
+---
+description: Padrão para camada CRUD, mantendo apenas acesso ao banco e queries.
+globs: "crud/**/*.py"
+alwaysApply: false
+---
+
+# CRUD
+
+A pasta `crud/` deve conter acesso ao banco e operações de persistência.
+
+## O CRUD deve fazer
+
+- `get`
+- `get_multi`
+- `create`
+- `update`
+- `remove`
+- filtros dinâmicos
+- paginação
+- ordenação
+- queries reutilizáveis
+
+## O CRUD não deve fazer
+
+- Regra de negócio pesada.
+- Validação de status de domínio.
+- Chamada para API externa.
+- Lançar mensagens de negócio específicas, exceto quando já for padrão do CRUD base.
+- Montar resposta HTTP.
+
+## Padrão recomendado
+
+```python
+from crud.base import CRUDBase
+from models.item_model import Item
+from schemas.item_schema import ItemCreate, ItemUpdate
+
+
+class CRUDItem(CRUDBase[Item, ItemCreate, ItemUpdate]):
+    pass
+
+
+crud_item = CRUDItem(Item)
+```
+
+## Filtros
+
+Quando criar filtros genéricos, manter padrão consistente:
+
+```python
+filters = {
+    "name": {"operator": "ilike", "value": "teste"},
+    "status": {"operator": "=", "value": "ativo"},
+}
+```
+
+## Async
+
+Se o projeto usa `AsyncSession`, os métodos CRUD devem ser `async` e usar `await` corretamente.
+
+## Retorno
+
+O CRUD deve retornar objetos de banco ou listas de objetos. Conversão para schema/resposta é responsabilidade do FastAPI/Pydantic ou do service quando necessário.

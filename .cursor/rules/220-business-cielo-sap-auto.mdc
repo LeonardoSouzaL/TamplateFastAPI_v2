@@ -1,0 +1,90 @@
+---
+description: Regras de negócio Cielo — consulta síncrona SAP, seriais provisórios ILG e picking.
+globs: "{services/consulta_sincrona.py,services/movement.py,services/client_gai.py,api/api_v1/endpoints/item.py,api/api_v1/endpoints/product.py,models/item_provisional_serial_model.py,models/location_model.py,schemas/consulta_sincrona_schema.py,schemas/item_provisional_serial_schema.py,schemas/item_schema.py}"
+alwaysApply: false
+---
+
+# Rule: Cielo e integração SAP
+
+## Escopo
+
+- `services/consulta_sincrona.py` — `ConsultaSincrona`
+- Trechos Cielo em `services/movement.py` (`create_movement`)
+- `api/api_v1/endpoints/item.py` (picking `delivery`, listagens/export Cielo)
+- `api/api_v1/endpoints/product.py` (measures)
+- `models/item_provisional_serial_model.py`, schemas relacionados
+
+Cliente Cielo: GAI `nome=CIELO` (group `arancia_client`); API expõe `client_code == 'cielo'` via `Location.client_code` (`nome.lower()`). Em writes de produto, `client_id` aceita **id GAI** ou alias legado **`1`** → `ClientGaiService.resolve_client_id`. Movimentos continuam usando `client_name == 'cielo'` no payload.
+
+## Regras obrigatórias
+
+1. Consulta síncrona: POST para API de integração com body `{"SERGE": "<serial>"}` (via `RequestClient` / `ConsultaSincrona`).
+2. Em movimento `IN` sem item existente: se Cielo e serial **não** começa com `ILG`, tentar consulta síncrona antes de criar item.
+3. Se consulta falhar e produto **não** for categoria `CHIP`: criar serial provisório `ILG-DDMMYY-####` e retornar **424** com `provisional_serial` no `detail`.
+4. Produto **CHIP**: consulta SAP **não se aplica** (CHIP não existe no SAP); **`product_id` obrigatório** em movimento `IN` Cielo; **sem serial provisório ILG** — retornar **400** se `product_id` ausente ou consulta falhar.
+5. Serial provisório `ILG*`: ao criar item, vincular registro provisório e ajustar `order_origin_id` para origem com `stock_type` **Aguardando Reversa (Seriais Provisórios)**.
+6. Produto Cielo (não-`CHIP`): `extra_info.measures` obrigatório na criação/atualização — ver também rule `230`.
+7. Endpoint `GET .../items/.../delivery/{serial}` (picking): **somente** cliente `cielo`.
+8. Export/resumo agregado por `ztipo`: **somente** cliente `cielo`.
+9. Divergência depósito SAP (`LGORT`) vs depósito Arancia é cenário operacional **esperado** (SAP assíncrono); picking grava `StockErrors` antes do HTTPException (incidente 12.3).
+
+## Fluxos principais
+
+### Entrada com consulta síncrona (`MovementService.create_movement`)
+
+1. Item não existe e tipo permite criação (`IN` / contexto de entrada).
+2. `client_name == 'cielo'` e serial não é `ILG*`.
+3. POST consulta síncrona; em sucesso, gravar resultado em `item.extra_info.consulta_sincrona`.
+4. Buscar/criar produto por SKU (`MATNR`); produto novo via SAP usa `resolve_client_id(1)` → id real do GAI CIELO (`created_by='SAP'`).
+5. Em falha SAP: se **CHIP** → **400** (`product_id` obrigatório, sem ILG); se não CHIP → provisório + 424.
+
+### Serial provisório (`before_insert` no model)
+
+Formato: `ILG-{DD}{MM}{YY}-{sequência diária 4 dígitos}`.
+
+### Picking / retorno (`read_item_delivery`)
+
+1. Serial UPPER; filtrar por `cielo`.
+2. Item deve existir e estar `IN_DEPOT`.
+3. Se `location_id` informado (≠ 0), deve coincidir com location do item.
+4. Query param `origin` (`intelipost` | `gtec`, default `intelipost`). Consulta síncrona obrigatória; validar:
+   - `location.deposito` == `consulta_sincrona.LGORT`
+   - Status SAP por origin:
+     - `intelipost`: `STTXU.strip() == 'DESN'` e `STTXT.strip() == 'DEPS'`
+     - `gtec`: `STTXU.strip() == 'RSVD'` e `STTXT.strip() == 'DEPS'` (erro: status esperado `RESERVADO (MA84/DEPS-RSVD)`)
+5. Em falhas de negócio (incl. divergência de depósito SAP vs Arancia), registrar `StockErrors` via `ItemService.salva_erro` antes do HTTPException.
+6. PINPAD: `required_chip=false`; demais categorias podem exigir chip vinculado ao mesmo `order_number` do último movimento de entrada.
+
+## Validações
+
+- Resumo export `agregate_by=ztipo` rejeita clientes ≠ cielo (**400**).
+- Measures ausentes em produto Cielo não-CHIP → **400** (product endpoints).
+
+## Integrações/eventos
+
+- URL da consulta síncrona hoje em código (`ConsultaSincrona` / `movement.py`); preferir configurável via settings em refatorações futuras, sem quebrar URL atual sem migração.
+- Erros de integração: **424** (`ConsultaSincrona`) ou **424** com payload estruturado no movimento.
+
+## Erros esperados
+
+| Situação | HTTP |
+| -------- | ---- |
+| Consulta síncrona indisponível | 424 |
+| Item/serial não encontrado (picking) | 404 |
+| Status ≠ IN_DEPOT | 400 |
+| Depósito SAP ≠ depósito Arancia | 400 |
+| Serial não em depósito no SAP (`origin=intelipost`) | 400 |
+| Status SAP inválido para GTEC (`origin=gtec`, esperado RSVD/DEPS) | 400 |
+| Endpoint picking para cliente ≠ cielo | 400 |
+
+## Testes esperados
+
+- IN Cielo CHIP exige `product_id`; falha SAP CHIP → 400 (sem ILG).
+- Falha SAP não-CHIP retorna 424 + `provisional_serial`.
+- Picking grava `StockErrors` nas falhas documentadas (incl. divergência depósito).
+- ILG vincula provisório e troca order_origin.
+
+## Fonte da regra
+
+- Código: `services/movement.py`, `services/consulta_sincrona.py`, `api/api_v1/endpoints/item.py`, `product.py`
+- Decisões: `.cursor/business-rules/decisions.md` (2026-06-01: CHIP, StockErrors, SAP assíncrono)

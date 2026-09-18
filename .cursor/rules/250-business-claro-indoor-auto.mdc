@@ -1,0 +1,89 @@
+---
+description: Regras Claro Indoor — catálogo de status do romaneio, extra_info e RomaneioEvent global.
+globs: "{services/romaneio*.py,services/claro_indoor*.py,api/api_v1/endpoints/claro_indoor.py,api/api_v1/endpoints/romaneio_v2.py,models/romaneio*.py,schemas/claro_indoor_schema.py,schemas/romaneio*.py,crud/crud_romaneio*.py}"
+alwaysApply: false
+---
+
+# Rule: Claro Indoor — status catalog, extra_info e eventos
+
+## Escopo
+
+- Prefix API: `/api/v1/claro/indoor`
+- Catálogo: `logistic_stock_romaneio_status` + `logistic_stock_romaneio_status_transition` (`process_code`)
+- Metadados Indoor: `romaneio.extra_info` (JSONB)
+- Histórico global: `logistic_stock_reverse_event` (`RomaneioEvent`) via `record_romaneio_event`
+
+## Catálogo de status (fonte de verdade)
+
+1. Sequência/validação Indoor **não** é hardcoded no service — lê tabelas com `process_code=INDOOR`.
+2. Unique `(process_code, code)` e `(process_code, action_code)`.
+3. Avanços 5–11: `assert_indoor_transition(action_code, current_status)` — se inválido → `status_romaneio_invalido`.
+4. Bipagem: `allows_item_insert` do status atual (Indoor: só `STARTED`).
+5. Romaneio em aberto: `is_finalizer=false`. Finalizador com movimento: `creates_item_movement=true` + `movement_type_on_finalize` (ex. `RETURN` → item via `MovementService`, nunca setar `item.status` direto).
+6. Consistência: se `is_finalizer=false` → sem movimento; se cria movimento → tipo obrigatório e presente em `MOVEMENT_ITEM_STATUS_MAP`.
+7. Enum `RomaneioStatus` tipa valores; **sequência Indoor = seed/tabelas**.
+8. GET `/status-catalog?process_code=` e `/status-catalog/transitions?process_code=` (default `INDOOR` nesta rota).
+9. **Pendência:** migrar hardcodes PA→CD (`_ADVANCE_ROMANEIO_TRANSITIONS`) para `process_code=PA_CD` — não misturar nesta leva.
+
+## `romaneio.extra_info` (Indoor)
+
+Chaves: `qualitor_ticket`, `nf_number`, `nf_file_url`, `packlist_exported_at`, `freight_number`, `agenda_number`, `collected_at`, `collected_by`.
+
+## RomaneioEvent (global)
+
+1. Todo fluxo que muta romaneio (Indoor, PA→CD/v2, insert-items, CK, create) grava evento.
+2. Helper: `services/romaneio_event.record_romaneio_event` — mesma transação; **`created_by` + `created_at` obrigatórios**.
+3. Sem `created_by` → `usuario_obrigatorio`.
+4. Tipos comuns: `CREATED`, `ITEM_ADDED`, `ITEM_REMOVED`, `STATUS_CHANGED`, `PACKING_FINISHED`, `COLLECTION_REQUESTED`, `CK_MARKED`, … (pipeline Indoor).
+
+## Paginação Indoor
+
+Rotas novas Indoor usam `page`/`page_size` + `PaginationMeta` (`schemas/claro_indoor_schema.py`). Não migrar skip/limit legado nesta leva.
+
+## Bipagem (etapa 4) e pipeline 5–11
+
+1. Service: `services/claro_indoor_romaneio.py` — create, volumes, preview/confirm, resumo, items/events, finish → collect.
+2. Create valida `location` ∈ `arancia_PA`|`arancia_CD`, `origin` ∈ `arancia_PA` (selecionável), destination GAI Claro. Lookups: `GET /lookups/romaneio-create` (`origins[]` = PA).
+3. Volumes: sequencial automático (`extra_info.indoor_volumes`); bipagem pode usar caixa anterior.
+4. Bipagem: `status_atlas` **exato** `SUSPEITO`; `giro` informativo (default `baixo`); duplicata no confirm → **409** `item_ja_no_romaneio`; confirm devolve totais/`recent_items` para UI sem reload.
+5. `GET /romaneios/{n}` = resumo; listagem `GET /romaneios` aceita `q` + números de controle.
+6. Hub: `GET /dashboard?location_id=` (0=all); KPIs incluem `items_inicializado`/`items_suspeito` + mapas.
+7. Avanços 5–11: `assert_indoor_transition(action_code)` na tabela; sem usuário → `usuario_obrigatorio`.
+8. PackList: XLSX liberado em qualquer fase; avanço `EXPORT_PACKLIST` só com `advance=true` e status `NF_ATTACHED`. Colunas: SERIAL, CÓDIGO, TECNOLOGIA, LOCAL TERMINAL (`localidade_atlas`), ESTADO TERMINAL (`status_atlas`), defaults de devolução, CX (`volume_number`).
+9. Collect: lê `creates_item_movement` / `movement_type_on_finalize` do status destino; movimento via `MovementService`.
+
+## Produtos Claro
+
+`GET/PATCH /products` — `extra_info.giro` ∈ `{alto, baixo}` **obrigatório** (default `baixo`; não null). Filtro `?giro=`.
+
+## MovementCreate.created_at
+
+Check-in Indoor pode honrar coluna `data` via `MovementPayload.created_at` → `MovementCreate.created_at` (omitir `None` para não anular default do banco).
+
+## Uploads 1–3 (service + endpoints)
+
+- Lotes **all-or-nothing**: valida todas as linhas; se houver falha ou `dry_run=true`, não persiste.
+- Check-in: `MovementService` `IN`; **localidade de estoque** = `location_id` (GAI do usuário logado) no multipart form — **não** coluna da planilha; `created_by` também via form; extras em `movement.extra_info`.
+- **Não** confundir localidade de estoque (`location_id` / GAI) com `localidade_atlas` (etapa Atlas → `item.extra_info`).
+- Atlas: `item.extra_info.status_atlas`/`localidade_atlas` + `product_id` por SKU Claro; coluna `localidade_atlas` sem alias `localidade`.
+- Contrato: `last_in.order_number` + `extra_info.contrato` (lote e PATCH unitário).
+- Itens: `GET /items` com `status_atlas` opcional (omitir = todos), `serial`/`contrato`; `GET /items/{serial}`; export por `status_atlas` (monitoramento) ou default `IN_DEPOT`.
+- Examples/templates: `GET /examples/{check-in|item-update|contrato-update|product|romaneio-bipagem}` (+ `/template` XLSX nos uploads).
+
+## Indoor SUPPLY (paralelo ao serializado)
+
+- `extra_info.cargo_type = "SUPPLY"` no romaneio; ausente/`SERIAL` = fluxo serializado atual.
+- Check-in Tec Supply: `POST/GET /check-in/tec-supply` — ENTRY no GAI CLARO via `SupplyMovementService`; `extra.source=claro_indoor_tec_supply` + `login_tec`; GET agrega por técnico + data (`America/Sao_Paulo`).
+- Sem Atlas, contratos ou bipagem. Bipagem/volumes/export-serials em romaneio SUPPLY → **400** `romaneio_supply_sem_bipagem`.
+- Linhas qty: tabela `logistic_stock_reverse_supply_item`; `POST/GET/DELETE .../supply-lines`; `POST .../finish-contents` (STARTED→READY, exige ≥1 linha).
+- Qualitor / NF / Frete / Agenda: reutilizam header (válidos para SERIAL e SUPPLY).
+- PackList SUPPLY: XLSX por SKU×qty (sem SERIAL).
+- Collect SUPPLY: só status/metadado (`DISPATCHED`); **sem** `MovementService` RETURN e **sem** EXIT de supply (saldo já entrou no check-in).
+- Migration: `a1b2c3d4e5f6` (HG + prod).
+
+## Spec e pendências
+
+- Spec integrador: `docs/claro-indoor-spec.md`.
+- Spec UI: `docs/claro-indoor-ui-screens.md`.
+- **Pendência explícita:** migrar hardcodes PA→CD (`_ADVANCE_ROMANEIO_TRANSITIONS` / mapas finish) para `process_code=PA_CD` nas mesmas tabelas de catálogo. Nesta leva só `INDOOR` é seedado/validado. Ver `.cursor/business-rules/pending-questions.md` e rule `210`.
+- Origem Indoor: GAI do grupo `arancia_PA` (**selecionável** via `origins` no lookup). Destino = GAI `CLARO`. Migration de correção: `e2f3a4b5c6d7` (remove GAI `ClaroReversa` após remapear dados). Script: `scripts/migrate_claro_reversa_to_pa_claro.sql`.

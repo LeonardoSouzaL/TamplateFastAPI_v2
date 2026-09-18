@@ -1,0 +1,56 @@
+---
+description: Regras de totais LastMile de viagens do dia por técnico/status e SLA.
+globs: "{api/api_v1/endpoints/lastmile_dashboard.py,services/lastmile_driver_service.py,crud/crud_lastmile_driver_metrics.py,schemas/lastmile_dashboard_schema.py,models/auth_app_model.py}"
+alwaysApply: false
+---
+
+# Rule: LastMile por técnico (somente leitura)
+
+## Escopo
+
+- `GET /api/v1/lastmile/dashboard/driver-status-summary`
+- Service `LastMileDriverService`, CRUD `CRUDLastMileDriverMetrics`
+- Fato: `order_travels.driver_id` → `auth_app.uid`
+
+Não misturar com totais de **OS** (`by-status` / `by-pa`, rules `202`/`203`). Não alterar `pa-summary` / `metrics` (rule `201`).
+
+## Regras obrigatórias
+
+- Somente leitura. Sem `create`/`update`/`remove`, sem migration, sem `create_all`.
+- Unidade = viagem (`order_travels`), não `service_order`.
+- Sem `order_type` → `LASTMILE_ORDER_TYPES` (`LASTMILE`, `LASTMILE_COLLECT`, `LASTMILE_DELIVERY`). CSV informado = `type IN (...)`. CSV vazio → totais 0.
+- Dia = query `created_at` (`date`, default hoje em `America/Sao_Paulo`) sobre `DATE(timezone('America/Sao_Paulo', coalesce(route_date, created_at)))`.
+- `designation_id` = `order_travels.designation_id` (PA da viagem, sem `validar_pa`). Não usar PA da OS.
+- `driver_id` = `order_travels.driver_id` (uid). `carrier_id` na viagem. `cliente_id` via JOIN `service_order`.
+- Sem `ilike` de nome e sem `order_id IN (...)`.
+- **Atraso:** `end_date` preenchido e `end_date < agora (UTC)`. Não usar hybrid `atrasado` (cotação).
+- **Sem prazo:** quote ausente ou `estimated_deadline` nulo/`0`.
+- **SLA:** `finished` / `in_progress` via `status_equipament.finished`.
+- `unassigned_travels` = `driver_id IS NULL`. `total_drivers` não conta uid nulo.
+- Nome do técnico via `auth_app` depois da agregação (`uid`, `name`, `cod_base`, `nome_unidade`).
+- Agregar no SQL (`GROUP BY` técnico/status + `COUNT FILTER` de SLA). Sem hidratar viagem e sem teto 5000.
+
+## Resposta
+
+- `date` = dia filtrado
+- `total_travels` / `total_drivers` / `unassigned_travels`
+- `by_status_global` e `drivers[].by_status` + `drivers[].sla`
+
+## Erros esperados
+
+| Código | Situação |
+| ------ | -------- |
+| 500 | Exceção não tratada (handler global, sem stack ao cliente) |
+
+## Testes esperados
+
+- Default LastMile de viagem (inclui `LASTMILE_DELIVERY`)
+- CSV `order_type` vazio → 0 sem consultar banco
+- `designation_id` recorta `order_travels.designation_id`
+- Atraso no SQL usa `end_date`, não cotação
+- `driver_id IS NULL` entra em `unassigned_travels`
+- Lookup de nome por `uid`
+
+## Fonte
+
+API-Transportes-V1 `GET .../dashboard/driver_status_summary`, reescrito com as regras de KPI da rule `201`.

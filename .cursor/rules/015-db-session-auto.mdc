@@ -1,0 +1,78 @@
+---
+description: Sessão SQLAlchemy async — engine, async_sessionmaker, get_db e DbDep para FastAPI.
+globs: "db/**/*.py,api/deps.py"
+alwaysApply: false
+---
+
+# Sessão async SQLAlchemy
+
+Complementa [`010-architecture-always.mdc`](010-architecture-always.mdc). Use em projetos FastAPI com `AsyncSession`.
+
+Templates copiáveis: `docs/cursor/templates/db/session.py` e `docs/cursor/templates/db/deps.py`.
+
+## Contexto deste projeto (stock-api)
+
+O `stock-api` usa **múltiplos bancos** em `db/session.py` e `api/deps.py`:
+
+- `SessionLocal_psql` (**async**, PostgreSQL principal) → dependency `get_db_psql` — banco padrão para novos módulos;
+- `SessionLocal_ag_ws` e `SessionLocal_211` (**sync**, bancos legados) → `get_db_ag_ws` / `get_db_211` — somente manutenção.
+
+Para novos endpoints, usar `get_db_psql` (async). Não criar novas dependências sync nem renomear as existentes sem decisão explícita. As seções abaixo descrevem o padrão de referência do template para novos projetos ou refatorações combinadas.
+
+## Engine e factory
+
+- `create_async_engine` com driver async (ex.: `postgresql+asyncpg://...`).
+- URL vem de `settings` em `core/config.py` — não hardcodar.
+- `async_sessionmaker(engine, expire_on_commit=False)` — recomendado em asyncio para acessar atributos após `commit` sem refresh extra.
+
+## Dependency `get_db`
+
+- Generator **async** com `yield`.
+- Usar `async with async_session_maker() as session: yield session` — não `db.close()` síncrono.
+- `get_db` gerencia **lifecycle** da sessão (abrir/fechar por request).
+- **Não** fazer auto-commit em `get_db` quando o CRUD já commita (ver [`045-crud-transaction-commit-auto.mdc`](045-crud-transaction-commit-auto.mdc)).
+
+```python
+from collections.abc import AsyncGenerator
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from core.config import settings
+
+engine = create_async_engine(settings.DATABASE_URL, echo=False)
+async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_maker() as session:
+        yield session
+```
+
+## Alias `DbDep` em `api/deps.py`
+
+Preferir `Annotated` + alias reutilizável (padrão FastAPI atual):
+
+```python
+from typing import Annotated
+
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from db.session import get_db
+
+DbDep = Annotated[AsyncSession, Depends(get_db)]
+```
+
+Endpoints importam `DbDep` de `api/deps.py` — não repetir `Depends(get_db)` inline em cada rota.
+
+## Anti-padrões
+
+- `Session` síncrono em app async.
+- `db.close()` síncrono no teardown de sessão async.
+- Auto-commit na dependency **e** no CRUD na mesma request (misturar abordagens).
+- Reutilizar `AsyncSession` da request em `BackgroundTasks` ou workers (ver rule 045).
+- Instanciar engine/sessionmaker dentro do endpoint.
+
+## Commit
+
+Neste template, o **commit fica no CRUD/service** (abordagem A). A dependency só entrega a sessão; ver rule 045 para transações multi-write.

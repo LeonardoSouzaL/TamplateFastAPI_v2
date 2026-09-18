@@ -30,8 +30,8 @@ services/
 ├── __init__.py
 ├── base_service.py
 ├── car_service.py
-├── service_order_service.py
-└── external_status_service.py
+├── lastmile_dashboard_service.py
+└── lastmile_driver_service.py
 ```
 
 ## Exemplo

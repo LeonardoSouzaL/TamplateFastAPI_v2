@@ -1,0 +1,66 @@
+---
+description: Regras de totais de OS LastMile agrupados por cliente (GAI).
+globs: "{api/api_v1/endpoints/lastmile_os_client.py,services/lastmile_os_client_service.py,crud/crud_lastmile_os_client_metrics.py,crud/lastmile_os_sla.py,schemas/lastmile_os_client_schema.py}"
+alwaysApply: false
+---
+
+# Rule: OS LastMile por cliente (somente leitura)
+
+## Escopo
+
+- `GET /api/v1/lastmile/orders/by-client` (endpoint **novo**)
+- Service `LastMileOsClientService`, CRUD `CRUDLastMileOsClientMetrics`
+- Fato: `service_order.client_id` → GAI `nome` (`cliente`)
+
+Não misturar com os KPIs de **viagem** (`pa-summary` / `metrics` / rule `201`), totais por status da OS (rule `202`) nem totais por PA (rule `203`). Não alterar `by-status` / `by-pa`.
+
+## Regras obrigatórias
+
+- Somente leitura. Sem `create`/`update`/`remove`, sem migration, sem `create_all`.
+- Unidade = OS (`service_order`), não `order_travels`.
+- Cliente = `service_order.client_id`. Nome via GAI depois da agregação, campo JSON `cliente`.
+- Sem `order_type` → padrões `LASTMILE_OS_TYPE_PATTERNS` com **ILIKE**: `LASTMILE_COLLECT`, `LASTMILE_NORMAL`, `LASTMILE_DESINSTAL%`, `LASTMILE_RETIRADA%`.
+- CSV `order_type` informado = `type IN (...)` exato. CSV vazio → totais 0.
+- `cliente_id` = `service_order.client_id` (recorte; no máximo 1 item no ranking).
+- `designation_id` = `service_order.designation_id` (PA da OS).
+- `data_inicial` / `data_final` = `service_order.created_at` `>=` / `<=` (opcionais). Não usar data da viagem.
+- Viagem atual = `DISTINCT ON (order_id) ORDER BY id DESC`.
+- **Sem técnico:** `driver_id IS NULL` na viagem atual **ou** OS sem viagem. Não exige pendente.
+- **`prazo_dias`:** `transport_quotes.estimated_deadline` da quote da viagem atual. Nulo ou `0` = sem prazo.
+- **Data limite:** `DATE(created_at da OS + prazo_dias)` em `America/Sao_Paulo`.
+- **Atendimento:** `DATE(end_date da viagem atual)` no mesmo fuso.
+- **Atraso:** há prazo e (`end_date` depois do limite **ou** sem `end_date` e hoje depois do limite).
+- **Dentro do prazo:** há prazo e não é atraso.
+- SLA compartilhado com `by-pa` em `crud/lastmile_os_sla.py`. Não divergir as expressões.
+- Agregar no SQL (`GROUP BY client_id` + `COUNT FILTER`). Não hidratar OS.
+
+## Resposta
+
+- `total` = soma de `chamado_count`
+- `chamado_count = atraso_count + dentro_do_prazo_count + sem_prazo_count`
+- `by_status_viagem` = `UPPER(status_equipament.type)` da viagem atual
+- Rankings no mesmo GET, em memória, sem SQL extra: `ofensores` (top 10 com `atraso_count > 0`), `cliente_ofensor` (primeiro ou null), `melhores` (top 10 com `dentro_do_prazo_count > 0`), `melhor_cliente` (primeiro ou null). Ordenação por quantidade desc, empate `client_id` desc. Sem percentual.
+
+## Erros esperados
+
+| Código | Situação |
+| ------ | -------- |
+| 500 | Exceção não tratada (handler global, sem stack ao cliente) |
+
+## Testes esperados
+
+- Default não usa `LASTMILE_DELIVERY`
+- CSV `order_type` vazio → 0 sem consultar banco
+- `GROUP BY` em `client_id`, não em `designation_id`
+- Sem viagem → `sem_tecnico`
+- `driver_id` preenchido não conta em `sem_tecnico`
+- `estimated_deadline = 0` → `sem_prazo`
+- Aberto com prazo vencido → atraso; atendido no limite → dentro do prazo
+- `cliente_ofensor` é o max de atraso de um cliente, não o total
+- Top 10 corta; atraso/dentro 0 não entra no ranking
+- Empate usa o maior `client_id`
+- Filtro `cliente_id` → no máximo 1 item
+
+## Fonte
+
+Spec LastMile OS por cliente 2026-09-18. Mesma visão e SLA do `by-pa` (rule `203`), dimensão `service_order.client_id`.

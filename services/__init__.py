@@ -8,14 +8,18 @@ Fluxo recomendado:
 Endpoint -> Service -> CRUD -> Banco
 """
 
-from services.car_service import CarService, car_service
-from services.service_order_service import ServiceOrderService, service_order_service
-from services.external_status_service import ExternalStatusService
+from services.lastmile_dashboard_service import (
+    LastMileDashboardService,
+    lastmile_dashboard_service,
+)
+from services.lastmile_driver_service import (
+    LastMileDriverService,
+    lastmile_driver_service,
+)
 
 __all__ = [
-    "CarService",
-    "car_service",
-    "ServiceOrderService",
-    "service_order_service",
-    "ExternalStatusService",
+    "LastMileDashboardService",
+    "lastmile_dashboard_service",
+    "LastMileDriverService",
+    "lastmile_driver_service",
 ]

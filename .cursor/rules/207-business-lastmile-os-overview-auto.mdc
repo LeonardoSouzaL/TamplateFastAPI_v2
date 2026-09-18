@@ -1,0 +1,68 @@
+---
+description: Regras de visão geral de OS LastMile (totais, prazo, efetividade).
+globs: "{api/api_v1/endpoints/lastmile_os_overview.py,services/lastmile_os_overview_service.py,crud/crud_lastmile_os_overview_metrics.py,crud/lastmile_os_sla.py,schemas/lastmile_os_overview_schema.py}"
+alwaysApply: false
+---
+
+# Rule: OS LastMile visão geral (somente leitura)
+
+## Escopo
+
+- `GET /api/v1/lastmile/orders/overview` (endpoint **novo**)
+- Service `LastMileOsOverviewService`, CRUD `CRUDLastMileOsOverviewMetrics`
+- Fato: `service_order` (totais globais, sem agrupamento)
+
+Não misturar com os KPIs de **viagem** (`pa-summary` / `metrics` / rule `201`), totais por status da OS (rule `202`), por PA (rule `203`), por cliente (rule `205`) nem por técnico (rule `206`). Não alterar `by-status` / `by-pa` / `by-client` / `by-driver`.
+
+## Regras obrigatórias
+
+- Somente leitura. Sem `create`/`update`/`remove`, sem migration, sem `create_all`.
+- Unidade = OS (`service_order`), não `order_travels`.
+- Sem `order_type` → padrões `LASTMILE_OS_TYPE_PATTERNS` com **ILIKE**: `LASTMILE_COLLECT`, `LASTMILE_NORMAL`, `LASTMILE_DESINSTAL%`, `LASTMILE_RETIRADA%`.
+- CSV `order_type` informado = `type IN (...)` exato. CSV vazio → totais 0.
+- `cliente_id` = `service_order.client_id`.
+- `designation_id` = `service_order.designation_id` (PA da OS).
+- `data_inicial` / `data_final` = `service_order.created_at` `>=` / `<=` (opcionais). Não usar data da viagem.
+- Viagem atual = `DISTINCT ON (order_id) ORDER BY id DESC`.
+- **Pendente:** `end_date` da viagem atual IS NULL (inclui OS sem viagem).
+- **Atendida:** `end_date` preenchido. `pendente_count + atendida_count = total`.
+- **Sem técnico:** `driver_id IS NULL` na viagem atual **ou** OS sem viagem. Não exige pendente.
+- **`prazo_dias`:** `transport_quotes.estimated_deadline` da quote da viagem atual. Nulo ou `0` = sem prazo.
+- **Data limite:** `DATE(created_at da OS + prazo_dias)` em `America/Sao_Paulo`.
+- **Atendimento:** `DATE(end_date da viagem atual)` no mesmo fuso.
+- **Atraso / fora do prazo:** há prazo e (`end_date` depois do limite **ou** sem `end_date` e hoje depois do limite). Pode cruzar com pendente (aberto vencido).
+- **Atendida no prazo:** há prazo, `end_date` preenchido e atendimento `<=` data limite. Não reutilizar `dentro_do_prazo` de `sla_expressions` (esse inclui aberto ainda no prazo).
+- SLA compartilhado em `crud/lastmile_os_sla.py` (`atraso` + `atendida_no_prazo_expression`). Não divergir as expressões nem alterar a tupla de `sla_expressions`.
+- Agregar no SQL (`COUNT FILTER`, **sem** `GROUP BY`). Não hidratar OS.
+
+## Resposta
+
+- Response plana: sem `items`, rankings, `by_status_viagem` ou nomes GAI.
+- `sem_tecnico_count` = “Sem Motorista” no card.
+- Percentuais no **service**, 2 casas, denominador 0 → `0.0`.
+- `atendida_no_prazo_percent` / `fora_do_prazo_percent` sobre `total`.
+- `efetividade_percent` = `atendida_no_prazo_count / (atendida_no_prazo_count + fora_do_prazo_count) * 100`.
+
+## Erros esperados
+
+| Código | Situação |
+| ------ | -------- |
+| 500 | Exceção não tratada (handler global, sem stack ao cliente) |
+
+## Testes esperados
+
+- Default não usa `LASTMILE_DELIVERY`
+- CSV `order_type` vazio → 0 sem consultar banco
+- Sem `GROUP BY`
+- Filtros `cliente_id` e `designation_id` na visão
+- Sem viagem → pendente e `sem_tecnico`
+- `driver_id` preenchido não conta em `sem_tecnico`
+- Aberto com prazo vencido → `fora_do_prazo` e `pendente`, não `atendida_no_prazo`
+- Atendido no limite → `atendida_no_prazo`; aberto ainda no prazo → só `pendente`
+- `pendente_count + atendida_count == total`
+- total 200, 120 no prazo, 40 fora → 60.0 / 20.0 / efetividade 75.0
+- total 0 → percentuais 0.0
+
+## Fonte
+
+Spec LastMile OS visão geral 2026-09-18. Mesma visão e SLA do `by-pa` / `by-client` (rules `203` / `205`), sem dimensão de agrupamento.

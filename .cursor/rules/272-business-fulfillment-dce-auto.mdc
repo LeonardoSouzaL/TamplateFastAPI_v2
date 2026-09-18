@@ -1,0 +1,74 @@
+---
+description: Integração Fulfillment — DCE dos Chamados Indoor (só se request_type.dace=true; create no OPEN, status no READY, cancel no CANCELLED).
+globs: "{services/fulfillment_dce.py,schemas/fulfillment_dce_schema.py,services/stock_request_service.py,api/api_v1/endpoints/stock_requests.py,models/stock_request_catalog_model.py,core/example-config.py,.env.example}"
+alwaysApply: false
+---
+
+# Rule: DCE Fulfillment (Chamados Indoor)
+
+## Escopo
+
+- `services/fulfillment_dce.py` — `FulfillmentDceService`
+- Create: **somente se `request_type.dace=true`**. Ao entrar em `OPEN` (`action=approve` e `POST /` se `approval_required=false`), **depois** da Abertura Transportes. Um volume com `requested_quantity`. **Não** esperar bipagem.
+- `request_type.dace=false` (padrão da coluna) → fluxo Indoor **sem** Fulfillment (viagem + reserva + e-mail). Não chama create/status/cancel. `POST /{id}/dce` → **409**.
+- Retry: `POST /api/v1/stock-requests/{id}/dce` se `dace=true` e `extra.dce.ok` não for true.
+- Status: `POST /transition` com `to_status_code=READY_FOR_PICKUP` consulta `GET /api/v2/dce/status` **antes** do tracking, **só se `dace=true`**. Sem endpoint Stock de consulta.
+- Cancel: `POST /transition` com `to_status_code=CANCELLED` se `dace=true` e `extra.dce.ok`.
+- **Não** confundir com Claro Indoor reversa (`/api/v1/claro/indoor`).
+- **Não** alterar `GET /api/v1/items/volumn_product_for_dce` (Fulfillment consultando o Stock).
+
+OpenAPI homolog: `http://192.168.0.216/homo-fulfillment/docs`. Create/status/cancel **não** exigem `api-key`.
+
+## Create (ao abrir o chamado)
+
+1. Pré-requisito: coluna `logistic_stock_request_types.dace=true`. Ausente/`false` → não chama Fulfillment.
+2. Gatilho: `OPEN` — `action=approve` **e** `POST /` com `approval_required=false`. Depois da Abertura v2, **antes** do commit / reserva supply.
+3. `POST {FULFILLMENT_API_BASE_URL}{FULFILLMENT_DCE_CREATE_PATH}` (`/api/v2/dce/create`).
+4. Body: `{ dce_payload, volume_number: 1 }` — um único volume com a **soma** de `requested_quantity` por produto. Endereço inclui `cityCode` (IBGE; CloDACE exige). CNPJ transportadora `000...0` cai no CNPJ do remetente.
+5. `externalId` = `protocol_number` (`SR########`).
+6. Shipper = GAI `from_location`; recipient = GAI `to_location` (`razao_social`/`nome`, `cnpj`, endereço, telefone).
+7. `transportMode` e CNPJ da transportadora vêm do `settings` (`FULFILLMENT_TRANSPORT_MODE=2` transportadora).
+8. Preço: `product.extra_info.measures.price` **> 0**. NCM: `extra_info.ncmCode` ou `84705010`.
+9. Se `extra.dce.ok` já true → não chama de novo (idempotente).
+10. Sucesso → `extra.dce.ok=true` no CREATED/APPROVED.
+11. Falha no approve → HTTP **424**, chamado permanece `AWAITING_APPROVAL` (sem persistir a falha). Retry = `approve` de novo.
+12. Falha no create sem aprovação → HTTP **424**, chamado **não persiste**.
+13. `POST /{id}/dce` = retry (409 se tipo sem DACE / já ok / inbound / sem qty solicitada). Falha → persiste `extra.dce.ok=false` + `DCE_FAILED` + **424**.
+
+## Status (ao marcar pronto para coleta)
+
+1. Gatilho: `to_status_code=READY_FOR_PICKUP` **depois** da cobertura e **antes** do tracking v3 / `update_status`.
+2. `request_type.dace=false` → pula a consulta e segue tracking / `READY_FOR_PICKUP`.
+3. A Fulfillment é a fonte da verdade — **não** exigir `extra.dce.ok` local.
+4. `GET {FULFILLMENT_API_BASE_URL}{FULFILLMENT_DCE_STATUS_PATH}?order_number={protocol_number}&volume_number=1`.
+5. Emitida: `DACe_status` em `AUTHORIZED` / `EMITIDA` / `ISSUED` (case-insensitive) **ou** `DACe_url` preenchida.
+6. Sucesso → `extra.dce_status.ok=true` + segue tracking + `READY_FOR_PICKUP`.
+7. Não emitida / 404 / timeout / 5xx → `extra.dce_status.ok=false` + history `DCE_STATUS_FAILED` + HTTP **424**. Status e tracking **inalterados**.
+
+## Cancel (ao cancelar o chamado)
+
+1. Gatilho: `to_status_code=CANCELLED` **depois** de validar a transição e **antes** de `update_status` / release de hold.
+2. `request_type.dace=false` → cancelamento Indoor normal, sem Fulfillment.
+3. Só se `extra.dce.ok`. Sem DCE ok → cancelamento Indoor normal, sem Fulfillment.
+4. Se `extra.dce_cancel.ok` já true → não chama de novo (idempotente).
+5. `POST {FULFILLMENT_API_BASE_URL}{FULFILLMENT_DCE_CANCEL_PATH}?order_number={protocol_number}&volume_number=1`.
+6. Sucesso → `extra.dce_cancel` + chamado vai para `CANCELLED`.
+7. Falha HTTP/rede → `extra.dce_cancel.ok=false` + history `DCE_CANCEL_FAILED` + HTTP **424**. Status e holds **inalterados**.
+8. `REJECTED` e cancel de package **não** disparam.
+
+## Fora desta fatia
+
+- Um DCE por package físico.
+
+## Erros
+
+| Situação | HTTP |
+| -------- | ---- |
+| Chamado inexistente | 404 |
+| Inbound / sem qty solicitada / DCE já ok (retry) / tipo com `dace=false` | 409 |
+| CNPJ/endereço/telefone/preço inválidos | 400 |
+| Fulfillment recusou create, status não emitido ou cancel | 424 |
+
+## Testes
+
+- `tests/services/test_fulfillment_dce.py`

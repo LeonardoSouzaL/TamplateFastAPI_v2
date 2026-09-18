@@ -1,0 +1,87 @@
+---
+description: Mantém o README real do projeto atualizado conforme novos módulos e mudanças relevantes são implementados.
+globs: "README.md,api/**/*.py,services/**/*.py,crud/**/*.py,models/**/*.py,schemas/**/*.py,core/**/*.py,tests/**/*.py,docs/**/*.md"
+alwaysApply: false
+---
+
+# Sincronização do README do projeto
+
+Quando o template começar a ser usado para desenvolver um projeto real, mantenha o `README.md` principal atualizado com informações reais do projeto.
+
+## Quando atualizar o README
+
+Atualize o README quando houver:
+
+- novo módulo de negócio;
+- nova pasta importante;
+- novo endpoint relevante;
+- novo service relevante;
+- nova integração externa;
+- novo fluxo de autenticação;
+- nova variável de ambiente obrigatória;
+- novo comando de execução;
+- novo comando de teste;
+- mudança importante na arquitetura;
+- alteração que impacta como outro dev usa o projeto.
+
+## O que documentar
+
+Documentar apenas:
+
+- o que existe no projeto;
+- o que acabou de ser implementado;
+- como executar;
+- como testar;
+- variáveis de ambiente necessárias;
+- endpoints reais;
+- estrutura real de pastas;
+- fluxos reais.
+
+Não inventar funcionalidades futuras como se já existissem.
+
+## Seção obrigatória: Alterações recentes
+
+Quando houver mudança relevante, manter ou criar uma seção no README chamada:
+
+```md
+## Alterações recentes
+```
+
+Use uma tabela simples:
+
+```md
+| Data | Tipo | Módulo/Pasta | Alteração | Impacto |
+| ---- | ---- | ------------ | --------- | ------- |
+| 2026-05-30 | Adicionado | `services/` | Criada camada de services para regras de negócio. | Endpoints passam a chamar services antes do CRUD. |
+```
+
+## Tipos sugeridos
+
+- `Adicionado`
+- `Alterado`
+- `Removido`
+- `Corrigido`
+- `Documentado`
+- `Sugestão`
+
+## Quando indicar necessidade de nova pasta
+
+Se a mudança mostrar que o projeto precisa de uma nova pasta, registre como sugestão:
+
+```md
+| 2026-05-30 | Sugestão | `workers/` | Projeto passou a ter tarefas assíncronas. | Avaliar criação de pasta própria para jobs/background tasks. |
+```
+
+## O que não registrar
+
+Não registrar alterações pequenas como:
+
+- typo;
+- ajuste visual mínimo;
+- formatação sem impacto;
+- renomeação interna sem impacto;
+- refatoração invisível para uso do projeto.
+
+## Regra final
+
+Ao finalizar uma alteração grande, verificar se o README precisa ser atualizado. Se precisar, atualizar no mesmo fluxo.

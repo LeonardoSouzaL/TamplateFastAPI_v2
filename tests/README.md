@@ -9,12 +9,17 @@ Ela deve seguir a mesma separação de camadas da aplicação.
 tests/
 ├── __init__.py
 ├── conftest.py
+├── crud/
+│   ├── test_lastmile_metrics_filters.py
+│   └── test_lastmile_driver_metrics_filters.py
 ├── services/
-│   └── test_car_service.py
+│   ├── test_car_service.py
+│   ├── test_lastmile_dashboard_service.py
+│   └── test_lastmile_driver_service.py
 └── api/
     └── api_v1/
         └── endpoints/
-            └── test_cars_endpoint.py
+            └── test_lastmile_dashboard_endpoint.py
 ```
 
 ## Responsabilidade

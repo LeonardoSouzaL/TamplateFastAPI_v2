@@ -1,0 +1,60 @@
+---
+description: Regras de arquitetura e organização entre camadas do template FastAPI.
+globs: "**/*"
+alwaysApply: true
+---
+
+# Arquitetura do projeto
+
+Mantenha a arquitetura em camadas. Cada pasta tem uma responsabilidade específica.
+
+Fluxo geral (banco e integrações): ver `000-project-context-always.mdc`.
+
+## Regras de dependência
+
+- `api/` pode importar `services/`, `schemas/`, `api/deps` e recursos de autenticação.
+- `services/` pode importar `crud/`, `schemas/`, `models/` quando necessário, e `core/`.
+- `crud/` pode importar `models/`, `schemas/` e base CRUD.
+- `schemas/` não deve importar `crud/`, `services/` ou `api/`.
+- `models/` não deve importar `services/`, `api/` ou `crud/`.
+- `core/` deve ser genérico e reutilizável, evitando depender de módulos de negócio.
+- `tests/` pode importar qualquer camada que esteja sendo testada.
+
+## Como criar um novo módulo
+
+Para um módulo chamado `orders`, o padrão esperado é:
+
+```text
+models/order_model.py
+schemas/order_schema.py
+crud/crud_orders.py
+services/order_service.py
+api/api_v1/endpoints/orders.py
+tests/services/test_order_service.py
+tests/api/api_v1/endpoints/test_orders_endpoint.py
+```
+
+## Quando criar service
+
+Crie ou use service quando houver:
+
+- validação de duplicidade;
+- normalização de campos;
+- transição de status;
+- chamadas para mais de um CRUD;
+- chamada para API externa;
+- regra condicional;
+- tratamento específico de erro;
+- montagem de payload complexo;
+- lógica que não pertence diretamente ao endpoint.
+
+## Quando não criar lógica nova no endpoint
+
+Não colocar no endpoint:
+
+- loops de negócio complexos;
+- validações com múltiplas consultas;
+- chamadas externas diretamente;
+- regras de cancelamento/finalização;
+- tratamento de status de domínio;
+- montagem de payloads grandes.

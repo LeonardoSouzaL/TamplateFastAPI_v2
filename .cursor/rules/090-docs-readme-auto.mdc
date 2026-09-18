@@ -1,0 +1,45 @@
+---
+description: Regras para documentação, READMEs por pasta e redução de redundância.
+globs: "**/README.md,docs/**/*.md"
+alwaysApply: false
+---
+
+# Documentação e READMEs
+
+A documentação deve ser útil, objetiva e conectada à estrutura real do projeto.
+
+## README principal
+
+O README principal deve conter visão geral do projeto, com links para documentações específicas.
+
+Deve evitar repetir detalhes que já estão em READMEs de subpastas.
+
+## READMEs por pasta
+
+Quando uma pasta tiver responsabilidade própria, pode ter um README explicando:
+
+- finalidade da pasta;
+- estrutura esperada;
+- exemplos de uso;
+- regras principais;
+- o que não deve ficar ali.
+
+## Regras
+
+- Não documentar funcionalidades inexistentes como se já existissem.
+- Sugestões devem ser marcadas como sugestões.
+- Evitar documentação duplicada.
+- Preferir links relativos para facilitar navegação no GitHub.
+- Atualizar documentação quando criar nova pasta relevante.
+- Atualizar documentação quando criar novo fluxo importante.
+
+## Links recomendados
+
+Quando existir documentação específica, o README principal deve apontar para ela:
+
+```md
+- [API](./api/README.md)
+- [Services](./services/README.md)
+- [Core](./core/README.md)
+- [Testes](./tests/README.md)
+```

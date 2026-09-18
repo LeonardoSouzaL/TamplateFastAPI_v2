@@ -7,11 +7,8 @@ Cada arquivo deve representar um recurso ou domínio da aplicação.
 
 ```text
 endpoints/
-├── cars.py
-├── service_orders.py
-├── travels.py
-├── clients.py
-└── tracking.py
+├── lastmile_dashboard.py
+└── cars.py  (exemplo do template; não registrado no router)
 ```
 
 ## Responsabilidade dos endpoints

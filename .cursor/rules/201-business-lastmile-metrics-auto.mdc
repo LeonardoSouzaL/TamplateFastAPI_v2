@@ -1,0 +1,63 @@
+---
+description: Regras de métricas LastMile somente leitura — KPIs, filtros e consultas SQL do dashboard.
+globs: "{api/api_v1/endpoints/lastmile_dashboard.py,services/lastmile_dashboard_service.py,crud/crud_lastmile_metrics.py,schemas/lastmile_dashboard_schema.py,models/order_travels_model.py,models/service_order_model.py}"
+alwaysApply: false
+---
+
+# Rule: Métricas LastMile (somente leitura)
+
+## Escopo
+
+- `GET /api/v1/lastmile/dashboard/pa-summary`
+- `GET /api/v1/lastmile/dashboard/metrics`
+- Service `LastMileDashboardService`, CRUD `CRUDLastMileMetrics`
+- Models slim: `order_travels`, `service_order`, `order_types`, `status_equipament`, GAI
+
+## Regras obrigatórias
+
+- Somente leitura. Sem `create`/`update`/`remove`, sem migration, sem `create_all`.
+- Lógica de KPI idêntica à API de Transportes v2.
+- **Pendente:** `status_equipament.finished == False` (inclui `RESCHEDULING`).
+- **Sem técnico:** pendente e `order_travels.driver_id IS NULL`. `sem_motorista` ignora `driver_id` do request.
+- **Finalizada:** `status_equipament.finished == True`.
+- **Atraso:** `end_date` preenchido e `end_date < agora (UTC)`. Independente de `finished`. Não usar hybrid `atrasado` (cotação).
+- **Tempo médio:** minutos `end_date - coalesce(start_date, route_date, created_at)` só em finalizadas com `end_date`.
+- **PA:** `order_travels.designation_id` (não o da OS). Nome via GAI depois da agregação.
+- **`worst_late_pa`:** quantidade = maior `late_count` de uma PA, não o total. Breakdown por PA se `group_by_client` ou `group_by_order_type`.
+- Sem `order_type` → `LASTMILE`, `LASTMILE_COLLECT`, `LASTMILE_DELIVERY`. CSV informado é respeitado. CSV vazio → totais 0.
+- Datas opcionais em `coalesce(route_date, created_at)`.
+- Agregar no SQL (`GROUP BY` + `COUNT FILTER`). Não hidratar viagem nem montar `order_id IN (...)`.
+
+## Filtros compartilhados
+
+- `designation_id` → `order_travels.designation_id` (sem `validar_pa`)
+- `carrier_id` → `order_travels.carrier_id` (ID, não nome)
+- `cliente_id` → JOIN `service_order.client_id`
+- `order_type` → JOIN `order_types.type IN (...)`
+
+## Pré-filtros por métrica / painel
+
+- `only_pending` → `finished = false`
+- `only_without_driver` → `finished = false` e `driver_id IS NULL`
+- `only_late=true/false` → inclui/exclui `end_date < now`
+- `pending` → não finalizada
+- `without_driver` → não finalizada + sem técnico
+- `finished` → finalizada
+- `worst_late_pa` → só atrasadas, `GROUP BY designation_id`, pega o max
+
+## Erros esperados
+
+| Código | Situação |
+| ------ | -------- |
+| 500 | Exceção não tratada (handler global, sem stack ao cliente) |
+
+## Testes esperados
+
+- Matriz de filtros e pré-filtros de cada `metric`
+- `sem_motorista` ignora `driver_id`
+- `worst_late_pa` retorna o max por PA
+- Default LastMile quando `order_type` é omitido
+
+## Fonte
+
+API-Transportes-V1 `order_travel_dashboard_service.py` (v2). Documento de análise LastMile 2026-09-15.

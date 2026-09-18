@@ -1,0 +1,23 @@
+---
+description: Docker Swarm — Dockerfile FastAPI, stack.yml, .dockerignore e .env.example para deploy em produção.
+globs: "{Dockerfile,Dockerfile.*,deploy/**,.dockerignore,.env.example,.editorconfig,.gitattributes}"
+alwaysApply: false
+---
+
+# Docker Swarm — stack e container (FastAPI)
+
+**Use a Skill `deploy-swarm-fastapi`** em `.cursor/skills/deploy-swarm-fastapi/SKILL.md`.
+
+Complementa `130-fastapi-swarm-deploy-manual.mdc`, `075-github-actions-ci-auto.mdc`, `080-security-config-always.mdc` e `333-observability-otel-loki-always.mdc`.
+
+## Princípios (globs desta rule)
+
+- `mode: host`, `update_config.order: stop-first`, rede `app_network` externa.
+- `CACHE_BUST` no Dockerfile antes de `COPY . .`.
+- `GET /health` → `{"status": "ok"}`; healthcheck com `curl`.
+- `requirements.txt` UTF-8; incluir `gunicorn` e `uvicorn[standard]`.
+- No Swarm: `OTEL_APPEND_IP_SUFFIX=False` no `.env` do servidor; `OTEL_DEFER_INIT=True` com `gunicorn_conf.py`.
+
+Templates: `docs/cursor/templates/Dockerfile.fastapi`, `deploy/stack.yml`, `dockerignore`, `env-example-swarm.env`.
+
+Confirmar `APP_PORT` e `STACK_NAME` com o usuário (rule `130`) antes de gerar arquivos.

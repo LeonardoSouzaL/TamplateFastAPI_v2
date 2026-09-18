@@ -1,0 +1,95 @@
+---
+description: Controle de transação no CRUD com commit=False para orquestração em endpoint/service.
+globs: "crud/**/*.py,api/**/*.py,services/**/*.py"
+alwaysApply: false
+---
+
+# Transação e commit no CRUD
+
+**Use a Skill `migrar-transacao-crud-fastapi`** em `.cursor/skills/migrar-transacao-crud-fastapi/SKILL.md` para auditar legado, gerar plano de migração e aplicar refatorações fase a fase.
+
+Complementa [`040-crud-auto.mdc`](040-crud-auto.mdc) e [`015-db-session-auto.mdc`](015-db-session-auto.mdc). Use em projetos FastAPI + SQLAlchemy (`AsyncSession` ou `Session`).
+
+## Sessão vs transação
+
+| Responsabilidade | Camada |
+|------------------|--------|
+| Abrir/fechar sessão por request | `get_db` em `db/session.py` (rule 015) |
+| `commit` / `rollback` / `flush` | CRUD ou service |
+
+- `get_db` **não** deve fazer auto-commit no happy path quando o CRUD já usa `commit=True` (default).
+- Evitar misturar abordagem A (commit no CRUD/service) com abordagem B (auto-commit na dependency).
+
+## Princípio
+
+- **CRUD persiste**; **endpoint ou service orquestra a transação**.
+- Métodos `create`, `update` e `remove` do CRUD base devem aceitar `commit: bool = True`.
+- `commit=True` (default): comportamento atual — `commit()` + `refresh()` quando necessário.
+- `commit=False`: apenas `flush()` — mantém a mesma conexão e transação aberta para o caller.
+
+## Quando usar `commit=False`
+
+- Endpoint ou service executa **2+ operações CRUD** na mesma requisição.
+- Operações devem ser **atômicas** (sucesso ou rollback juntos).
+- Refatoração de legado com múltiplos `commit()` por request (reduz pressão no pool e latência).
+
+## Quem faz o `commit`
+
+| Camada | Responsabilidade |
+|--------|------------------|
+| CRUD | `flush()` ou `commit()` conforme parâmetro |
+| Service / endpoint | Um único `await db.commit()` no happy path |
+| Service / endpoint | `await db.rollback()` em falha antes de propagar erro |
+
+Preferir **service** como dono da transação quando houver regra de negócio. Endpoint só orquestra transação simples (ex.: webhook com poucas escritas).
+
+## Padrão recomendado
+
+```python
+# service ou endpoint — transação única
+try:
+    history = await crud_tracking_history.create(db, obj_in=data, commit=False)
+    await crud_order_sumary.update(db, db_obj=order, obj_in=update_data, commit=False)
+    await db.commit()
+except Exception:
+    await db.rollback()
+    raise
+```
+
+```python
+# crud/base.py — default preserva compatibilidade
+async def create(self, db: AsyncSession, *, obj_in: CreateSchemaType, commit: bool = True) -> ModelType:
+    db_obj = self.model(**obj_in.model_dump())
+    db.add(db_obj)
+    if commit:
+        await db.commit()
+        await db.refresh(db_obj)
+    else:
+        await db.flush()
+        await db.refresh(db_obj)  # refresh após flush se precisar do id gerado
+    return db_obj
+```
+
+## Refatoração de legado
+
+1. Adicionar `commit: bool = True` no CRUD base **sem alterar callers existentes**.
+2. Identificar endpoints com múltiplos `create`/`update`/`remove` na mesma sessão (buscar por sequências de CRUD write).
+3. Migrar para `commit=False` + commit único no caller.
+4. Cobrir com teste: `commit` chamado **uma vez** no happy path; `rollback` em falha intermediária.
+
+## BackgroundTasks e filas
+
+- **Nunca** reutilizar a `AsyncSession` da request em task em background.
+- Abrir sessão nova no worker/task; usar `commit=True` (transação local e curta).
+- Propagar contexto de trace/log; não propagar sessão de banco.
+
+## Evitar
+
+- `commit=False` espalhado sem `commit()` final no caller → dados não persistidos.
+- `commit()` dentro de loop no CRUD ou service → N commits por request.
+- `refresh()` após `select` que acabou de carregar o objeto → query extra desnecessária.
+- Service fazer `commit()` e endpoint fazer outro `commit()` na mesma sessão sem necessidade.
+
+## Sessão síncrona (`Session`)
+
+Mesma regra: parâmetro `commit: bool = True`; orquestração no caller com um único `db.commit()`.

@@ -1,0 +1,70 @@
+---
+description: Regras de negócio do Supply Control (insumos não serializáveis / saldo quantitativo).
+globs: "{services/supply_movement_service.py,services/supply_service.py,services/claro_indoor_tec_supply.py,api/api_v1/endpoints/supplies.py,schemas/supply_schema.py,schemas/supply_movement_schema.py,schemas/supply_movement_type_schema.py,models/supply_model.py,models/supply_movement_model.py,models/supply_movement_type_model.py,crud/crud_supply.py,crud/crud_supply_movement.py,crud/crud_supply_movement_type.py,core/supply.py,services/movement.py}"
+alwaysApply: false
+---
+
+# Rule: Supply Control (insumos)
+
+## Escopo
+
+- Endpoints `/api/v1/supplies*`
+- Facade Indoor: `/api/v1/claro/indoor/check-in/tec-supply` (`ClaroIndoorTecSupplyService`)
+- Services `SupplyMovementService`, `SupplyMovementTypeService`, `SupplyService`
+- Tabelas `logistic_stock_supplies`, `logistic_stock_supplies_movements`, `logistic_stock_supplies_movements_types`
+- Helper `core/supply.is_supply_product`
+- Gate no `MovementService` (fluxo serializado)
+
+## Isolamento de fluxos
+
+| Fluxo | Superfície | Controle |
+| ----- | ---------- | -------- |
+| **Serializado** (existente) | `POST /v1/movements`, bag, romaneio SERIAL, Indoor serializado | Item + serial + `logistic_stock_movement` |
+| **Supply Control** | `/v1/supplies*` | Saldo quantitativo por produto+localidade |
+| **Indoor SUPPLY** (facade) | `/v1/claro/indoor` com `cargo_type=SUPPLY` | ENTRY no check-in via Supply Control; romaneio paralelo sem bipagem |
+
+- **Não** misturar insumos em Movement API / bag / romaneio **serializado**.
+- Facade Indoor SUPPLY é permitida: chama apenas `SupplyMovementService` (ENTRY no check-in). Coleta Indoor SUPPLY **não** altera saldo.
+- Produtos de insumo: `product.extra_info.supplies === true` (coluna JSON existente `extra_info`; **não** confundir com `OrderOrigin.stock_type = "Suprimento P/ Entrega"`).
+
+## Regras obrigatórias
+
+1. Supply Control aceita **somente** produtos com `extra_info.supplies=true`; caso contrário **400**.
+2. Movement API (`create_movement`) **rejeita** produtos com `extra_info.supplies=true` → **400** (orientar `/v1/supplies/movements`).
+3. Ao movimentar: upsert em `logistic_stock_supplies` por `(product_id, location_id)` se não existir (quantity inicial 0).
+4. Toda movimentação grava histórico em `logistic_stock_supplies_movements`.
+5. **Saldo negativo não permitido** → **400** com detalhe de disponível vs solicitado.
+6. Tipos seed: `ENTRY` (`+`), `EXIT` (`-`), `TRANSFER` (`extra.transfer=true`).
+7. **TRANSFER**: exige `from_location_id` e `to_location_id` distintos; aplica `-` na origem e `+` no destino (ignora `operator` no cálculo).
+8. **ENTRY** (`operator=+`): exige `to_location_id`.
+9. **EXIT** (`operator=-`): exige `from_location_id`.
+10. Remover tipo de movimentação só se não houver movimentos vinculados → senão **409**.
+11. Cadastro de produto insumo continua em `POST /v1/products` com `extra_info.supplies=true`.
+
+## Fluxo `create_supply_movement`
+
+1. Validar produto existe e `is_supply_product`.
+2. Carregar tipo por `movement_type_id`.
+3. Validar localidades conforme tipo (ENTRY/EXIT/TRANSFER).
+4. Aplicar deltas de saldo (TRANSFER bilateral; demais via `operator`).
+5. Se o saldo **aumentou** (ENTRY ou destino de TRANSFER), completar holds faltantes de chamados Indoor `OPEN`/`IN_SEPARATION` no mesmo produto+localidade (`fulfill_pending_supply_holds`; prioridade DESC, SLA ASC). EXIT e origem de TRANSFER não alocam.
+6. Persistir movimento na mesma transação.
+7. Commit único ao final.
+8. Response do **POST** `/movements` inclui `message` (quantidade processada + saldo final), `balance_after` e `from_balance_after`/`to_balance_after`. Listagem GET não inclui esses campos.
+
+## Endpoints
+
+| Método | Path | Função |
+|--------|------|--------|
+| GET | `/v1/supplies` | Listar saldos |
+| GET | `/v1/supplies/{id}` | Saldo por id |
+| GET/POST | `/v1/supplies/movements` | Listar / registrar |
+| GET | `/v1/supplies/movements/{id}` | Detalhe |
+| CRUD | `/v1/supplies/movement-types` | Tipos |
+
+## Proibido
+
+- Reutilizar `MovementService` / `Item` para insumos.
+- Alterar mapas de status serializado por causa de Supply Control.
+- Usar texto de log/SKU para identificar insumo — usar `extra_info.supplies`.
+- Permitir saldo negativo.

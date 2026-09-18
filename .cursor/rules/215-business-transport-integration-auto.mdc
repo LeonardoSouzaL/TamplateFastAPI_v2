@@ -1,0 +1,184 @@
+---
+description: Integração Transportes — Abertura v2, tracking v3 e POST integration_system/status da viagem só no READY_FOR_PICKUP.
+globs: "{services/transport_service_order.py,schemas/transport_service_order_schema.py,services/romaneio.py,services/stock_request_service.py,api/api_v1/endpoints/stock_requests.py,core/example-config.py,.env.example}"
+alwaysApply: false
+---
+
+# Rule: Integração Transportes (Abertura v2 + tracking v3 + status da viagem)
+
+## Escopo
+
+- `services/transport_service_order.py` — `TransportServiceOrderService`
+- `schemas/transport_service_order_schema.py`
+- Gatilho PA→CD: `RomaneioService.advance_romaneio` com `movement_type=COLLECTION_REQUEST`
+- Gatilho Indoor abertura: `StockRequestService.create` sem `approval_required` **ou** `transition` com `action=approve`
+- Gatilho Indoor tracking: `to_status_code=READY_FOR_PICKUP`
+- Gatilho Indoor viagem: `to_status_code=READY_FOR_PICKUP` (depois do tracking v3; se houver OS)
+- Diagnóstico: `GET /api/v1/stock-requests/{id}/transport`
+
+Contrato HTTP: `docs/abertura-v2-stock.md` e `docs/abertura-v2-integracao.md`. Tracking: `POST /api/v3/order_tracking/batch/apply`. Status da viagem: `docs/spec-stock-atualizar-viagem.md` (`POST /api/v2/integration_system/status`, só `status_travel`).
+
+A v2 cria **OS + itens + cotação + viagem** numa chamada. Não usar Abertura v1. Não reabrir OS no READY_FOR_PICKUP. Não mandar `status_os` no POST de status (atualiza a OS; o Estoque não quer isso).
+
+## Fluxo PA→CD (COLLECTION_REQUEST)
+
+1. Finish `POST /v2/romaneios/finish/{n}` com `movement_type=COLLECTION_REQUEST`.
+2. Romaneio → `IN_PROCESSING`.
+3. `open_collection_request` → `POST {TRANSPORT_API_BASE_URL}{TRANSPORT_SERVICE_ORDER_ABERTURA_PATH}`.
+4. Sucesso → `COLLECTION_REQUESTED`.
+5. Falha → `PROCESSING_ERROR` + HTTP **424**.
+
+## Fluxo Chamado Indoor (ao entrar em OPEN)
+
+1. Gatilhos: `POST /api/v1/stock-requests/{id}/transition` com `action=approve`, **ou** `POST /api/v1/stock-requests` quando `request_type.approval_required=false`.
+2. Se `extra.transport.service_order_id` já existir, não chama a v2.
+3. Senão `open_indoor_trip` **antes** de reserva supply / commit (no approve: também antes de `update_status`).
+4. Sucesso (200 ou 400 “OS já em andamento com viagem”) → persiste `extra.transport` → `OPEN` + e-mail `APPROVED` (mesmo HTML do approve).
+5. Falha no approve → chamado **permanece `AWAITING_APPROVAL`** + HTTP **424**.
+6. Falha no create sem aprovação → HTTP **424** e o chamado **não persiste** (rollback).
+7. Inbound (`create_inbound_alert`) **não** dispara Abertura v2.
+
+## Fluxo Indoor READY_FOR_PICKUP (tracking v3 + status da viagem)
+
+1. `POST /transition` com `to_status_code=READY_FOR_PICKUP` (após cobertura).
+2. Se `request_type.dace=true`, confirma DCE (`GET /dce/status`) **antes** do tracking. Rule `272`.
+3. Se `extra.transport.service_order_id` existir → `send_indoor_ready_tracking`.
+4. Senão skip + log warning (`skipped=true`).
+5. Falha HTTP/timeout **não** bloqueia: chamado vai para `READY_FOR_PICKUP`.
+6. Persistir `extra.transport_tracking` + `history.extra.transport_tracking`.
+7. Volumes = packages com `status != CANCELLED` (controle do que o CD/PA vai enviar). **Não** recalcula paletes e **não** altera OS/cotação (já herdados da abertura).
+8. Payload v3: `destination=order`, `targets=[{id: service_order_id}]`, `data.created_by=estoque`, `data.event_type=READY_FOR_PICKUP` (cadastro **geral**, não cadastrar no tipo 63 / CIELO / `REDESPACHO_BOBINAS`), `data.description` = `Chamado {protocol_number} pronto para coleta` + ` - {observação}` se o operador preencheu `description`/`resume` na transição (senão a `description` da abertura), `data.extra_information.volumes` + `order_type=TRANSPORT_INDOOR_READY_ORDER_TYPE` (default `REDESPACHO_BOBINAS`). Sem `extra_information.itens`. Sem `EXTERNO` e sem `01-PRONTO PARA DESPACHO`. O tracking **não** altera status de OS/viagem/item.
+9. **Depois** do tracking, se `extra.transport` existir, alinhar **só a viagem** (`sync_indoor_travel_status`). Tracking sozinho deixa a viagem em “aguardando estoque”.
+
+## Fluxo Indoor status da viagem (integration_system)
+
+A Abertura v2 já cria a viagem (painel: **aguardando estoque**). O Stock **não** manda status na abertura.
+
+O único passo Indoor que muda a **viagem** (não a OS) é o pronto para coleta:
+
+```text
+OPEN (Abertura)     → viagem "aguardando estoque"   (já nasce no Transportes)
+READY_FOR_PICKUP    → POST integration_system/status  (só status_travel)
+                    → viagem "pronto para coleta"
+                    + tracking v3 READY_FOR_PICKUP (rastro)
+collect / cancel    → não chama o Transportes
+```
+
+1. `transition` `READY_FOR_PICKUP` → `status_travel` = `TRANSPORT_INDOOR_READY_TRAVEL_STATUS` (default `Pronto para coleta`; type **ou** rótulo do cadastro `REDESPACHO_BOBINAS`). `description` = `READY_FOR_PICKUP`. Sem `extra.transport` → skip.
+2. **Não** usar `01-PRONTO PARA DESPACHO` (dispara finish de romaneio). Se o default der 404 no HG, ajustar só o `.env`.
+3. GET `{BASE}{TRANSPORT_INTEGRATION_LIST_PATH}?EX={os}` antes do POST; se `travel.status.type` **ou** `description` já bater (case-insensitive) com o valor de config → skip.
+4. GET falhou → tenta o POST mesmo assim.
+5. POST `{BASE}{TRANSPORT_INTEGRATION_STATUS_PATH}` com `service_order` = EX da Abertura (`extra.transport.external_order_number`, senão protocolo), `created_by=ESTOQUE`. **Não** enviar `status_os`, `uid` nem `RESCHEDULING`.
+6. HTTP 500: um retry com backoff curto. 400/404/422: sem retry.
+7. Falha **não** bloqueia o READY (mesmo padrão do tracking). Snapshot em `extra.transport_status` + `history.extra.transport_status`. `travel_id` da resposta 200 vai para `extra.transport.travel_id`.
+8. `POST /collect` e `transition` `CANCELLED`/`REJECTED` **não** chamam este POST (sem `FINISHED`/`UNDUE`). `OPEN` / `IN_SEPARATION` / `AWAITING_*` não disparam. Romaneio PA→CD e inbound `RECEIVED` ficam fora.
+
+## GET diagnóstico
+
+`GET /api/v1/stock-requests/{id}/transport` — só leitura local, **não** chama Transportes.
+
+| `diagnosis` | `side` |
+| ----------- | ------ |
+| `NO_OS` | `stock` |
+| `ABERTURA_OK` | `ok` |
+| `TRACKING_SKIPPED` | `stock` |
+| `TRACKING_OK` | `ok` |
+| `TRACKING_FAILED` | `transportes` |
+| `TRAVEL_STATUS_SKIPPED` | `ok` se já alinhado; senão `stock` |
+| `TRAVEL_STATUS_OK` | `ok` |
+| `TRAVEL_STATUS_FAILED` | `transportes` |
+
+Se existir `extra.transport_status`, o diagnóstico da viagem prevalece sobre o tracking.
+
+## Payload compartilhado
+
+- Abertura: `created_by` = `"ESTOQUE"` (literal).
+- Tracking: `created_by` = `"estoque"` (literal).
+- Status da viagem: `created_by` = `"ESTOQUE"` (literal).
+- `estimated_deadline` int obrigatório na abertura (romaneio: `0`; indoor: dias até `sla_due_at`, mínimo 0).
+- Abertura: `POST {TRANSPORT_API_BASE_URL}{TRANSPORT_SERVICE_ORDER_ABERTURA_PATH}`.
+- Tracking: `POST {TRANSPORT_API_BASE_URL}{TRANSPORT_SERVICE_ORDER_TRACKING_PATH}`.
+- Status da viagem: GET `{TRANSPORT_API_BASE_URL}{TRANSPORT_INTEGRATION_LIST_PATH}` + POST `{TRANSPORT_API_BASE_URL}{TRANSPORT_INTEGRATION_STATUS_PATH}`.
+
+## Payload PA→CD
+
+| Campo | Valor |
+| ----- | ----- |
+| `service.external_order_number` | `romaneio_number` |
+| `service.cliente` | GAI contratante (`client.nome`) |
+| `service.order_type` | `settings.TRANSPORT_ORDER_TYPE` (default `REVERSA PA/CD`) |
+| `service.origin` / `destination` | `{id}` de `origin_id` / `destination_id` |
+| Itens | agrupados por `volume_number`; pai `BOX`, seriais em `sub_itens` |
+
+## Payload Indoor
+
+| Campo | Valor |
+| ----- | ----- |
+| `service.external_order_number` | `external_protocol` se preenchido; senão `protocol_number` (`SR########`) |
+| `service.cliente` | `client.nome` |
+| `service.order_type` | `settings.TRANSPORT_INDOOR_ORDER_TYPE` (default `REDESPACHO_BOBINAS`) |
+| `service.origin` / `destination` | `{id, nome}` de `from_location` / `to_location` |
+| `service.extra_information.approved_by` | login do `approve` |
+| `service.extra_information.protocol_number` | sempre o protocolo interno `SR########` |
+| Itens | **uma linha do chamado = 1 item**. Paletes = `ceil(qty / 1600)`. `item_control`/`extra.volumes` = qtd de paletes; `serial_number` e `extra.requested_quantity` = qty **total** da linha (`qty-item.id` se repetir); supply `product_model={sku} - {description}` (sem descrição ou descrição=SKU → `{sku} - BOBINA`; sem sku → `BOBINA`; Tipo UNIQUE o Transportes força sem sub_itens); serializado = `SKU - description`. Ex.: qty 3500 sku `000001` desc `BOBINA` → 1 item, serial `3500`, modelo `000001 - BOBINA`, volume 3 |
+| Supply | `extra_info.supplies === true`; peso = unitário × qty **total** da linha |
+| Não enviar | `client_id` / `service_order_id` no item |
+
+## Persistência Indoor
+
+`extra.transport`: `external_order_number`, `service_order_id`, `item_ids`, `quote_travel`, `opened_at`. Snapshot no history `APPROVED` (approve) ou `CREATED` (create sem aprovação).
+
+`extra.transport_tracking`: último READY (`ok`, `http_status`, `volumes_sent`, `error`, `skipped`). Snapshot no history da transição.
+
+`extra.transport_status`: último POST da viagem (`ok`, `http_status`, `status_travel`, `stock_status`, `travel_id`, `skipped`, `error`). Snapshot no history de `READY_FOR_PICKUP`.
+
+## Configuração (env)
+
+- `TRANSPORT_API_BASE_URL` — vazio escolhe pelo ambiente: homolog `http://192.168.0.215/hg-api-transportes`; produção `http://192.168.0.216/api-transportes`. Com `type_name=homologacao`, URL de produção ou `/api-transportes` no host 215 é redirecionada para HG.
+- `TRANSPORT_SERVICE_ORDER_ABERTURA_PATH`
+- `TRANSPORT_SERVICE_ORDER_TRACKING_PATH`
+- `TRANSPORT_INTEGRATION_STATUS_PATH`
+- `TRANSPORT_INTEGRATION_LIST_PATH`
+- `TRANSPORT_API_TIMEOUT`
+- `TRANSPORT_ORDER_TYPE`
+- `TRANSPORT_INDOOR_ORDER_TYPE`
+- `TRANSPORT_INDOOR_READY_ORDER_TYPE`
+- `TRANSPORT_INDOOR_READY_EVENT_TYPE`
+- `TRANSPORT_INDOOR_READY_TRAVEL_STATUS` — type ou rótulo da viagem no READY (default `Pronto para coleta`; **não** `01-PRONTO PARA DESPACHO`)
+- `TRANSPORT_CARRIER_NAME`
+
+Nunca hardcodar URL/timeout na regra de negócio.
+
+## Erros
+
+| Situação | HTTP |
+| -------- | ---- |
+| Falha HTTP/timeout/resposta inválida Transportes (romaneio) | 424 + `PROCESSING_ERROR` |
+| Falha Transportes no `approve` Indoor | 424; status permanece `AWAITING_APPROVAL` |
+| Falha Transportes no create sem aprovação | 424; chamado **não** persiste |
+| Falha de tracking no `READY_FOR_PICKUP` | 200; chamado segue; ver GET `/transport` |
+| Falha ao alinhar viagem no `READY_FOR_PICKUP` | 200; chamado segue; ver GET `/transport` (`TRAVEL_STATUS_FAILED`) |
+| 400 OS ativa com viagem (Indoor) | sucesso idempotente |
+| Romaneio sem `origin_id` ou `destination_id` | 400 |
+| Chamado sem itens / sem origem-destino | 400 |
+
+## Testes esperados
+
+- Payload romaneio agrupa volumes; `created_by=ESTOQUE`; `estimated_deadline=0`.
+- Payload indoor: 1 item por linha; `item_control`/volumes = paletes `ceil(qty/1600)`; `serial_number` e `requested_quantity` = qty **total** da linha; supply `product_model={sku} - {description}`; `external_order_number` = `external_protocol` ou `SR########`; `order_type=REDESPACHO_BOBINAS`.
+- `approve` chama v2 antes de `update_status`; falha 424 não reserva nem muda status.
+- Create sem `approval_required` chama v2 antes do commit; falha 424 não persiste o chamado; dispara o mesmo e-mail `APPROVED`.
+- READY envia tracking `REDESPACHO_BOBINAS` + volumes e, com OS, POST `status_travel` de config **sem** `status_os`; GET igual (type ou rótulo) → skip; 500 retry uma vez; falha não bloqueia `READY_FOR_PICKUP`.
+- Collect/cancel/reject **não** chamam o POST da viagem.
+- Unitários mockados; validação manual só em homologação (`hg-api-transportes`).
+
+## Fonte
+
+- Código: `services/transport_service_order.py`, `services/romaneio.py`, `services/stock_request_service.py`
+- Docs Transportes: `docs/abertura-v2-stock.md`
+- Tracking READY (contrato Stock): `docs/tracking-v3-stock.md`
+- Indoor `REDESPACHO_BOBINAS` (`event_type=READY_FOR_PICKUP` global): `docs/tracking-v3-redespacho-bobinas-stock.md`
+- Handoff Transportes: `docs/tracking-v3-ready-for-pickup-transportes.md`
+- Status da viagem (Stock): `docs/spec-stock-atualizar-viagem.md`
+- Pré-alerta de recebimento (coleta da viagem Transportes → aviso Stock): `docs/pre-alerta-recebimento-transportes.md` (endpoint implementado; receive = ENTRY supply, rule `271`)
+- README: seção Integração Transportes
